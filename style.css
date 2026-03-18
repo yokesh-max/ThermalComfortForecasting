@@ -1,0 +1,179 @@
+/* ---- Google Font ---- */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
+html,
+body,
+[class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+/* ---- Main Background White ---- */
+.stApp {
+    background-color: #FAFAFA !important;
+}
+
+/* sidebar backgroud */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #1A73E8 0%, #0D47A1 100%) !important;
+    box-shadow: 2px 0 10px rgba(0, 0, 0, 0.1);
+}
+
+.sidebar-title {
+    color: white;
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-bottom: 20px;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+/* sidebar labels */
+[data-testid="stSidebar"] label {
+    color: rgba(255, 255, 255, 0.9) !important;
+    font-weight: 600 !important;
+}
+
+/* sidebar button styles */
+[data-testid="stSidebar"] .stButton>button {
+    background-color: #00E676 !important;
+    color: #004D40 !important;
+    font-weight: 1000 !important;
+    border-radius: 8px !important;
+    border: none !important;
+    width: 260% !important;
+    transition: all 0.3s ease !important;
+}
+
+[data-testid="stSidebar"] .stButton>button:hover {
+    background-color: #00C853 !important;
+    transform: translateY(-2px);
+}
+
+/* Headings visibility */
+h1,
+h2,
+h3 {
+    color: #1A237E !important;
+    /* Deep Blue for high visibility */
+    font-weight: 700 !important;
+}
+
+/* File uploader box - Enhanced Visibility */
+[data-testid="stFileUploader"] {
+    border: 0px dashed #42A5F5 !important;
+    border-radius: 16px !important;
+    background-color: #E3F2FD !important;
+    padding: 10px !important;
+}
+
+[data-testid="stFileUploader"] label {
+    color: #0D47A1 !important;
+    font-weight: 700 !important;
+}
+
+/* Success/Error visibility */
+.stSuccess {
+    background-color: #E8F5E9 !important;
+    color: #1B5E20 !important;
+    border: 1px solid #C8E6C9 !important;
+    font-weight: 600 !important;
+}
+
+.stInfo {
+    background-color: #E1F5FE !important;
+    color: #01579B !important;
+    border: 1px solid #B3E5FC !important;
+}
+
+/* AI Insights Box styling */
+.ai-insights-container {
+    background-color: #FFFFFF;
+    padding: 25px;
+    border-radius: 16px;
+    border-top: 6px solid #1A73E8;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+    margin-top: 20px;
+    color: #202124;
+    line-height: 1.6;
+}
+
+.ai-insights-container h4 {
+    color: #1A73E8;
+    margin-top: 0;
+}
+
+/* ---- ROBUST PRIMARY BUTTON OVERRIDES ---- */
+/* Higher specificity using data-testid and stAppViewMainArea */
+[data-testid="stAppViewMainArea"] button[data-testid="stBaseButton-primary"],
+[data-testid="stAppViewMainArea"] .stButton>button[kind="primary"] {
+    background: linear-gradient(135deg, #66BB6A 0%, #43A047 100%) !important;
+    color: white !important;
+    font-weight: 700 !important;
+    border: none !important;
+    border-radius: 12px !important;
+    padding: 10px 24px !important;
+    transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) !important;
+    box-shadow: 0 4px 15px rgba(76, 175, 80, 0.3) !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.8px !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+[data-testid="stAppViewMainArea"] button[data-testid="stBaseButton-primary"]:hover,
+[data-testid="stAppViewMainArea"] .stButton>button[kind="primary"]:hover {
+    transform: translateY(-4px) scale(1.03) !important;
+    background: linear-gradient(135deg, #81C784 0%, #66BB6A 100%) !important;
+    box-shadow: 0 10px 30px rgba(76, 175, 80, 0.5) !important;
+    color: white !important;
+}
+
+[data-testid="stAppViewMainArea"] button[data-testid="stBaseButton-primary"]:active,
+[data-testid="stAppViewMainArea"] .stButton>button[kind="primary"]:active {
+    transform: scale(0.97) !important;
+}
+
+/* AI Analysis Button - Specific Rounding */
+.ai-btn-container button[data-testid="stBaseButton-primary"] {
+    border-radius: 40px !important;
+}
+
+/* Train & Analyse Button - Glowing Pulse Animation */
+@keyframes premium-glow {
+    0% {
+        box-shadow: 0 0 5px rgba(76, 175, 80, 0.4);
+        transform: scale(1);
+    }
+
+    50% {
+        box-shadow: 0 0 25px rgba(76, 175, 80, 0.7);
+        transform: scale(1.02);
+    }
+
+    100% {
+        box-shadow: 0 0 5px rgba(76, 175, 80, 0.4);
+        transform: scale(1);
+    }
+}
+
+.train-btn-container button[data-testid="stBaseButton-primary"] {
+    animation: premium-glow 2.5s infinite ease-in-out !important;
+    font-size: 1.15rem !important;
+}
+
+/* EDA & Preprocessing shared hover lift */
+.eda-btn-container button[data-testid="stBaseButton-primary"]:hover,
+.preprocess-btn-container button[data-testid="stBaseButton-primary"]:hover {
+    filter: brightness(1.1) !important;
+}
+
+/* Hide Streamlit elements */
+#MainMenu,
+footer {
+    visibility: hidden;
+}
+
+header {
+    background-color: transparent !important;
+}
