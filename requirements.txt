@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+scikit-learn
+tensorflow<2.16
+matplotlib
+seaborn
+joblib
+groq
+python-dotenv
