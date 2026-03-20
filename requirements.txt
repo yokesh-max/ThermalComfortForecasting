@@ -8,5 +8,5 @@ seaborn
 joblib
 python-dotenv
 plotly
-anthropic
 openpyxl
+anthropic
