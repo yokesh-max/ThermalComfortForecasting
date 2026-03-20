@@ -1,5 +1,11 @@
 import numpy as np
 import warnings
+import os
+import random
+
+# Suppress TensorFlow internal C++ logging (fixes _audio_microfrontend_op.so not found warnings)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 warnings.filterwarnings('ignore')
 
 from sklearn.preprocessing import MinMaxScaler
@@ -15,6 +21,8 @@ from tensorflow.keras.optimizers import Adam
 # Fix random seeds for reproducibility
 np.random.seed(42)
 tf.random.set_seed(42)
+random.seed(42)
+os.environ['PYTHONHASHSEED'] = str(42)
 
 # ── CONFIGURATION ─────────────────────────────────────────────────
 FEATURES = [
@@ -28,10 +36,11 @@ FEATURES = [
 ]
 TARGET      = 'PMV'
 WINDOW      = 12      # 12 steps × 5 min = 1 hour lookback
-TRAIN_RATIO = 1.0     # 100% train (user provides manual split)
+TRAIN_RATIO = 0.7     # 70% train / 30% test
 EPOCHS      = 100     # max epochs (early stopping will cut this short)
 BATCH_SIZE  = 16
 PATIENCE    = 15      # early stopping patience
+SAVE_DIR    = "saved_models"
 
 # THERMAL COMFORT LOGIC (ISO 7730 / Fanger PMV)
 
@@ -290,8 +299,4 @@ def predict_lstm(model, X_window, feat_scaler, pmv_scaler, last_12_raw, new_inpu
         pred_scaled = model.predict(window_input)[0][0]
         
     pred_raw = pmv_scaler.inverse_transform([[pred_scaled]])[0][0]
-    return float(pred_raw)
-
-
-
 
