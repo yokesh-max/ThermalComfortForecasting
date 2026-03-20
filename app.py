@@ -542,7 +542,10 @@ else: # nav_choice == "Home"
                     st.markdown('</div>', unsafe_allow_html=True)
 
                 if gen_ai:
-                    with st.status(f"🤖 Claude ({model_name}) is analyzing...", expanded=False) as status:
+                    with st.status(f"🤖 Claude ({model_name}) is planning your analysis...", expanded=True) as status:
+                        st.markdown('<div class="thinking-status">📑 Drafting analysis protocol... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
+                        ag.stream_text_animation("", delay=0.01)
+                        
                         plan_code = f"""
 # ANALYSIS EXECUTION PLAN
 1. SCAN_HISTORY: Reading latest {len(df)} data points
@@ -552,21 +555,27 @@ else: # nav_choice == "Home"
 5. GENERATE_INSIGHTS: Extracting building efficiency optimizations
 6. OPTIMIZE_VALUES: Determining PMV=0 settings
                         """
-                        st.code(plan_code, language="markdown")
+                        ag.stream_text_animation(plan_code, delay=0.005, is_code=True, language="markdown")
+                        
+                        st.markdown('<div class="thinking-status">📊 Calculating thermodynamic correlations... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
+                        ag.stream_text_animation("", delay=0.01)
+                        
+                        st.markdown('<div class="thinking-status">🧠 Finalizing actionable insights... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
+                        ag.stream_text_animation("", delay=0.01)
                         
                         # Pass the latest reading too
                         latest_reading = df.sort_values('DateTime')[HVAC_FEATURES].iloc[-1]
                         insights, opt_values = ag.get_ai_insights(df, latest_reading, model_id=model_id)
-                        status.update(label="✅ Analysis Complete!", state="complete")
+                        status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
                     
                     # Store results in session state
                     st.session_state.insights_generated = True
                     st.session_state.ai_insights_text = insights
                     st.session_state.ai_recommendations = opt_values
                     
-                    # Word-by-word streaming for the initial display (now much faster)
+                    # Word-by-word streaming for the initial display
                     with st.expander("🔍 **Detailed AI Analysis**", expanded=True):
-                        ag.stream_text_animation(insights.split('OPTIMAL_VALUES:')[0], delay=0.002)
+                        ag.stream_text_animation(insights.split('OPTIMAL_VALUES:')[0], delay=0.005)
 
                 elif st.session_state.get("insights_generated"):
                     with st.expander("🔍 **Detailed AI Analysis**", expanded=True):
