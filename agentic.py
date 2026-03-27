@@ -5,10 +5,12 @@ import os
 import json
 import io
 import time
+import base64
 from anthropic import Anthropic
 from dotenv import load_dotenv
 import hvac_models as hm
 import lstm
+import re
 
 # ── ENV & CLAUDE ──────────────────────────────────────────────────
 load_dotenv()
@@ -28,42 +30,89 @@ def load_dataframe(file_bytes, file_extension):
     return None
 
 def stream_text_animation(text, delay=0.01, is_code=False, language="python"):
-    """Simulates a creative typewriter/streaming effect for text or code."""
+    """Simulates a creative word-by-word or character-by-character streaming effect."""
     placeholder = st.empty()
     full_text = ""
     
-    # Adding a glowing container for the stream
-    prefix = '<div class="streaming-container">'
-    suffix = '</div>'
-    
-    for char in text:
-        full_text += char
-        if is_code:
-            placeholder.code(full_text, language=language)
-        else:
-            placeholder.markdown(full_text)
-        time.sleep(delay)
+    # Use word-by-word for larger text blocks (non-code) for "awesome" faster feel
+    if not is_code and len(text.split()) > 5:
+        words = text.split(" ")
+        for i, word in enumerate(words):
+            full_text += word + (" " if i < len(words)-1 else "")
+            placeholder.markdown(full_text + "▌")
+            # Adaptive delay based on word length, average around requested delay
+            time.sleep(max(0.01, delay * 5)) 
+        placeholder.markdown(full_text)
+    else:
+        # Character-based for code or very short snippets
+        for char in text:
+            full_text += char
+            if is_code:
+                placeholder.code(full_text, language=language)
+            else:
+                placeholder.markdown(full_text + "▌")
+            if delay > 0:
+                time.sleep(delay)
+        placeholder.markdown(full_text)
     return full_text
 
 def get_ai_insights(df, latest_reading, model_id="claude-sonnet-4-5"):
     """Send data summary and last reading to Claude and return AI analysis + optimal values."""
     if not claude_client:
         return "Claude client not initialised. Check your API key.", None
+        
+    stats_str = ""
+    try:
+        norm = lambda s: s.lower().replace(' ','').replace('_','').replace('-','')
+        col_map = {norm(c): c for c in df.columns}
+        available_features = [col_map[norm(f)] for f in hm.FEATURES if norm(f) in col_map]
+        target_col = next((c for c in df.columns if c.lower() == hm.TARGET.lower()), None)
+        cols_to_describe = available_features + ([target_col] if target_col else [])
+        if cols_to_describe:
+            stats = df[cols_to_describe].describe().loc[['mean', 'min', 'max']]
+            stats_str = stats.to_string()
+    except Exception:
+        pass
     
     prompt = f"""
-    Analyse the following HVAC sensor dataset and provide an elaborate, detailed, and comprehensive professional analysis for building energy optimisation.
+    Analyze the following HVAC sensor dataset and provide a highly concise Professional Overview (no over-explanation).
+    
+    Overall Dataset Statistics (Mean, Min, Max):
+    {stats_str}
     
     Current Building State (Last Reading):
     {latest_reading.to_dict()}
     
-    Physics Constraints to follow:
+    Physics Constraints & System Architecture:
     1. Cooling Power Increase -> PMV Decrease
     2. Flowrate Increase -> PMV Decrease (more cold water)
     3. Return AI CO2 is a proxy for heat load.
     
+    Inputs Mapping:
+    - Flowrate (m³/s) – Air circulation rate
+    - CHWR-CHWS (°C) – Chilled water temperature difference (cooling load indicator)
+    - Cooling_Power (W) – Primary control input
+    - Return_air_static_pressure (Pa) – System pressure
+    - Return_air_Co2 (ppm) – Indoor air quality indicator
+    - Offcoil_Temperature (°C) – Air handler discharge temperature
+    - Return_air_RH (%) – Indoor relative humidity
+    
+    Output Objective:
+    - PMV value 5 minutes ahead
+    
+    BREVITY RULE: 
+    Do not explain the inputs or outputs listed above. Only use them to inform your 2-3 bullet point analysis.
+    
     Task:
-    1. Provide a textual analysis (exactly 5-6 concise but informative bullet points explaining the reasonings).
+    1. Provide a very concise textual analysis (exactly 2-3 short bullet points).
     2. Suggest OPTIMAL numerical values for all 7 features to achieve PMV = 0.0.
+    
+    FORMATTING:
+    - Use Title: "##### 🏗️ Professional HVAC Analysis for PMV-Neutral Comfort"
+    - Each section MUST be extremely brief (maximum 1-2 lines or 2-3 bullet points).
+    - Provide the 2-3 bullet points under the heading "##### 🔍 Key Insights".
+    - Provide a Vertical Markdown Table (7 rows x 2 columns) titled "##### ✅ Optimal HVAC Settings" with columns "Parameters" and "Target Values".
+    - Finally, provide the JSON block at the very end.
     
     IMPORTANT: Provide the optimal values at the end of your response in a JSON block like this:
     OPTIMAL_VALUES: {{"Cooling_Power": X, "Flowrate": Y, "CHWR-CHWS": Z, "Offcoil_Temperature": A, "Return_air_Co2": B, "Return_air_static_pressure": C, "Return_air_RH": D}}
@@ -104,6 +153,270 @@ def get_ai_insights(df, latest_reading, model_id="claude-sonnet-4-5"):
                     f"(Details: {error_msg})"), None
         return f"Error during AI analysis: {error_msg}", None
 
+
+
+# ── FILE ICON MAPPING ─────────────────────────────────────────────
+FILE_ICONS = {
+    '.png': '🖼️', '.jpg': '🖼️', '.jpeg': '🖼️', '.gif': '🖼️', '.svg': '🖼️',
+    '.csv': '📊', '.xlsx': '📊', '.xls': '📊',
+    '.md': '📝', '.txt': '📄', '.json': '📋', '.html': '🌐',
+    '.py': '🐍', '.pdf': '📕',
+}
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+TEXT_EXTENSIONS  = {'.csv', '.md', '.txt', '.json', '.html', '.py', '.log', '.yaml', '.yml'}
+
+def _get_file_icon(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return FILE_ICONS.get(ext, '📎')
+
+def _get_mime_type(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    mime_map = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.svg': 'image/svg+xml', '.bmp': 'image/bmp',
+        '.webp': 'image/webp', '.csv': 'text/csv', '.md': 'text/markdown',
+        '.txt': 'text/plain', '.json': 'application/json', '.html': 'text/html',
+        '.py': 'text/x-python', '.pdf': 'application/pdf',
+        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    }
+    return mime_map.get(ext, 'application/octet-stream')
+
+
+def _extract_filenames_from_code(code_str):
+    """
+    Parse Python/bash code for file-creation patterns and return
+    a dict mapping extension-category to list of filenames found.
+    e.g. {'image': ['PCDL_PMV_Forecast_Advanced.png'], 'csv': ['PCDL_PMV_60min_Forecast.csv']}
+    """
+    import re
+    found = {'image': [], 'csv': [], 'text': [], 'other': []}
+    
+    # savefig('filename.png') / savefig("filename.png")
+    for m in re.finditer(r"savefig\s*\(\s*['\"]([^'\"]+)['\"]", code_str):
+        fname = os.path.basename(m.group(1))
+        found['image'].append(fname)
+    
+    # to_csv('filename.csv') / to_csv("filename.csv")
+    for m in re.finditer(r"to_csv\s*\(\s*['\"]([^'\"]+)['\"]", code_str):
+        found['csv'].append(os.path.basename(m.group(1)))
+    
+    # to_excel('filename.xlsx')
+    for m in re.finditer(r"to_excel\s*\(\s*['\"]([^'\"]+)['\"]", code_str):
+        found['other'].append(os.path.basename(m.group(1)))
+    
+    # to_json('filename.json')
+    for m in re.finditer(r"to_json\s*\(\s*['\"]([^'\"]+)['\"]", code_str):
+        found['text'].append(os.path.basename(m.group(1)))
+    
+    # to_markdown('filename.md')
+    for m in re.finditer(r"to_markdown\s*\(\s*['\"]([^'\"]+)['\"]", code_str):
+        found['text'].append(os.path.basename(m.group(1)))
+    
+    # open('filename', 'w') patterns
+    for m in re.finditer(r"open\s*\(\s*['\"]([^'\"]+)['\"].*?['\"]w", code_str):
+        fname = os.path.basename(m.group(1))
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in IMAGE_EXTENSIONS:
+            found['image'].append(fname)
+        elif ext == '.csv':
+            found['csv'].append(fname)
+        elif ext in TEXT_EXTENSIONS:
+            found['text'].append(fname)
+        else:
+            found['other'].append(fname)
+    
+    return found
+
+
+def extract_generated_files(message):
+    """
+    Extract generated files (images, CSVs, text, etc.) from Claude
+    code-execution response content blocks.
+    Uses a two-pass approach:
+      Pass 1 — collect filenames from bash commands + text_editor create paths
+      Pass 2 — extract file data and match to real filenames
+    Returns a list of dicts: [{name, data_b64, media_type, ext}, ...]
+    """
+    files = []
+    if not hasattr(message, 'content'):
+        return files
+
+    blocks = message.content
+
+    # ── PASS 1: Collect filenames from commands ──────────────────────
+    image_names = []   # ordered list of image filenames from savefig etc.
+    text_editor_names = []  # filenames from text_editor create commands
+    
+    for block in blocks:
+        btype = getattr(block, 'type', '') if not isinstance(block, dict) else block.get('type', '')
+        
+        # Bash commands → scan code for savefig / to_csv / etc.
+        if btype == 'server_tool_use':
+            tool_name = getattr(block, 'name', '') if not isinstance(block, dict) else block.get('name', '')
+            inp = getattr(block, 'input', {}) if not isinstance(block, dict) else block.get('input', {})
+            
+            if tool_name == 'bash_code_execution' and inp:
+                cmd = inp.get('command', '') if isinstance(inp, dict) else getattr(inp, 'command', '')
+                if cmd:
+                    found = _extract_filenames_from_code(cmd)
+                    image_names.extend(found['image'])
+                    # CSV / text / other files created via bash script
+                    for fn in found['csv'] + found['text'] + found['other']:
+                        text_editor_names.append(fn)
+            
+            elif tool_name == 'text_editor_code_execution' and inp:
+                cmd = inp.get('command', '') if isinstance(inp, dict) else getattr(inp, 'command', '')
+                path = inp.get('path', '') if isinstance(inp, dict) else getattr(inp, 'path', '')
+                if cmd == 'create' and path:
+                    text_editor_names.append(os.path.basename(path))
+
+    # ── PASS 2: Extract file data ────────────────────────────────────
+    image_counter = 0
+    te_create_counter = 0  # tracks text_editor create order
+    
+    for block in blocks:
+        btype = getattr(block, 'type', '') if not isinstance(block, dict) else block.get('type', '')
+
+        # ── Images from code_execution_result ──
+        if btype == 'code_execution_result':
+            sub_content = getattr(block, 'content', []) if not isinstance(block, dict) else block.get('content', [])
+            if not isinstance(sub_content, list):
+                sub_content = [sub_content]
+            for item in sub_content:
+                item_type = getattr(item, 'type', '') if not isinstance(item, dict) else item.get('type', '')
+                if item_type == 'image':
+                    src = getattr(item, 'source', None) if not isinstance(item, dict) else item.get('source')
+                    if src:
+                        data_b64 = getattr(src, 'data', '') if not isinstance(src, dict) else src.get('data', '')
+                        media = getattr(src, 'media_type', 'image/png') if not isinstance(src, dict) else src.get('media_type', 'image/png')
+                        ext = '.' + media.split('/')[-1].split('+')[0] if '/' in media else '.png'
+                        # Use real filename if available
+                        if image_counter < len(image_names):
+                            fname = image_names[image_counter]
+                        else:
+                            fname = f"generated_chart_{image_counter + 1}{ext}"
+                        image_counter += 1
+                        files.append({'name': fname, 'data_b64': data_b64, 'media_type': media, 'ext': os.path.splitext(fname)[1].lower()})
+
+        # ── server_tool_use: capture file text from text_editor create ──
+        if btype == 'server_tool_use':
+            tool_name = getattr(block, 'name', '') if not isinstance(block, dict) else block.get('name', '')
+            inp = getattr(block, 'input', {}) if not isinstance(block, dict) else block.get('input', {})
+            
+            if tool_name == 'text_editor_code_execution' and inp:
+                cmd = inp.get('command', '') if isinstance(inp, dict) else getattr(inp, 'command', '')
+                path = inp.get('path', '') if isinstance(inp, dict) else getattr(inp, 'path', '')
+                file_text = inp.get('file_text', '') if isinstance(inp, dict) else getattr(inp, 'file_text', '')
+                if cmd == 'create' and path and file_text:
+                    fname = os.path.basename(path)
+                    ext = os.path.splitext(fname)[1].lower()
+                    data_b64 = base64.b64encode(file_text.encode('utf-8')).decode('utf-8')
+                    media = _get_mime_type(fname)
+                    files.append({'name': fname, 'data_b64': data_b64, 'media_type': media, 'ext': ext})
+
+        # ── bash_code_execution_tool_result: capture stdout files ──
+        if btype == 'bash_code_execution_tool_result':
+            content_obj = getattr(block, 'content', None) if not isinstance(block, dict) else block.get('content')
+            if content_obj:
+                stdout = getattr(content_obj, 'stdout', '') if not isinstance(content_obj, dict) else content_obj.get('stdout', '')
+                if stdout:
+                    # Convention: FILE_OUTPUT:<filename>:<base64data>
+                    if 'FILE_OUTPUT:' in stdout:
+                        for line in stdout.split('\n'):
+                            if line.startswith('FILE_OUTPUT:'):
+                                parts = line.split(':', 2)
+                                if len(parts) == 3:
+                                    fname = parts[1]
+                                    data_b64 = parts[2]
+                                    ext = os.path.splitext(fname)[1].lower()
+                                    media = _get_mime_type(fname)
+                                    files.append({'name': fname, 'data_b64': data_b64, 'media_type': media, 'ext': ext})
+                    
+                    # Detect base64-encoded file output from bash scripts
+                    # e.g. "Saved forecast_data.csv" → check if we have pending text_editor filenames
+                    # For CSV/text files generated by Python scripts via bash,
+                    # they won't appear as content blocks — we capture them from
+                    # the savefig/to_csv patterns if Claude also outputs them via text_editor
+
+    # Deduplicate by filename (keep first occurrence)
+    seen = set()
+    deduped = []
+    for f in files:
+        if f['name'] not in seen:
+            seen.add(f['name'])
+            deduped.append(f)
+    return deduped
+
+
+@st.dialog("📂 File Preview", width="large")
+def preview_file_dialog(file_info):
+    """Streamlit dialog that shows a file preview with download and close."""
+    fname = file_info['name']
+    data_b64 = file_info['data_b64']
+    ext = file_info.get('ext', os.path.splitext(fname)[1]).lower()
+    media_type = file_info.get('media_type', 'application/octet-stream')
+    raw_bytes = base64.b64decode(data_b64)
+
+    st.markdown(f"##### {_get_file_icon(fname)} {fname}")
+    st.markdown("---")
+
+    # ── Preview based on file type ──
+    if ext in IMAGE_EXTENSIONS:
+        st.image(raw_bytes, caption=fname, use_container_width=True)
+    elif ext == '.csv':
+        try:
+            df = pd.read_csv(io.BytesIO(raw_bytes))
+            st.dataframe(df, use_container_width=True)
+        except Exception:
+            st.code(raw_bytes.decode('utf-8', errors='replace'), language='text')
+    elif ext == '.md':
+        st.markdown(raw_bytes.decode('utf-8', errors='replace'))
+    elif ext == '.json':
+        try:
+            parsed = json.loads(raw_bytes.decode('utf-8'))
+            st.json(parsed)
+        except Exception:
+            st.code(raw_bytes.decode('utf-8', errors='replace'), language='json')
+    elif ext in TEXT_EXTENSIONS:
+        lang_map = {'.py': 'python', '.html': 'html', '.yaml': 'yaml', '.yml': 'yaml', '.txt': 'text'}
+        st.code(raw_bytes.decode('utf-8', errors='replace'), language=lang_map.get(ext, 'text'))
+    else:
+        st.info(f"Preview not available for `{ext}` files. Use the download button below.")
+
+    st.markdown("---")
+    col_dl, col_close = st.columns(2)
+    with col_dl:
+        st.download_button(
+            label="⬇️ Download File",
+            data=raw_bytes,
+            file_name=fname,
+            mime=media_type,
+            use_container_width=True,
+            type="primary"
+        )
+    with col_close:
+        if st.button("✖️ Close", use_container_width=True):
+            st.rerun()
+
+
+def display_file_cards(files, msg_idx=0):
+    """Render clickable file cards for a list of generated files."""
+    if not files:
+        return
+    st.markdown('<div class="file-cards-row">', unsafe_allow_html=True)
+    cols = st.columns(min(len(files), 4))
+    for i, f in enumerate(files):
+        with cols[i % len(cols)]:
+            icon = _get_file_icon(f['name'])
+            ext_label = f.get('ext', '').replace('.', '').upper() or 'FILE'
+            if st.button(
+                f"{icon}  {f['name']}",
+                key=f"file_card_{msg_idx}_{i}_{f['name']}",
+                use_container_width=True,
+                help=f"Click to preview ({ext_label})"
+            ):
+                preview_file_dialog(f)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def display_chatbot():
@@ -211,11 +524,61 @@ def display_chatbot():
             font-size: 1.1rem !important;
             color: #1A237E !important;
         }
+        /* ── Generated File Cards ── */
+        .file-card {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            background: linear-gradient(135deg, #EDE7F6, #E3F2FD);
+            border: 1px solid #B0BEC5;
+            border-radius: 12px;
+            padding: 12px 18px;
+            margin: 6px 8px 6px 0;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+            max-width: 280px;
+        }
+        .file-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 18px rgba(26, 115, 232, 0.25);
+            border-color: #1A73E8;
+        }
+        .file-card .file-icon {
+            font-size: 1.8rem;
+            flex-shrink: 0;
+        }
+        .file-card .file-info {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+        .file-card .file-name {
+            font-weight: 700;
+            font-size: 0.88rem;
+            color: #1A237E;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .file-card .file-type {
+            font-size: 0.72rem;
+            color: #5F6368;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .file-cards-row {
+            display: flex;
+            flex-wrap: wrap;
+            margin-top: 10px;
+            gap: 4px;
+        }
         </style>
     """, unsafe_allow_html=True)
 
     # Anthropic client is initialized at the top of the script
-    model_name = st.session_state.get("model_select", "Claude Sonnet 4.5")
+    reset_cnt = st.session_state.get("reset_counter", 0)
+    model_name = st.session_state.get(f"model_select_{reset_cnt}", "Claude Sonnet 4.5")
     if "Opus" in model_name:
         model_id = "claude-opus-4-6"
     else:
@@ -292,16 +655,84 @@ def display_chatbot():
 
     # Initialize messages if empty (Greeting)
     if not st.session_state.messages:
-        if st.session_state.get("main_df") is not None:
-            initial_msg = f"Hello! I'm your **Agentic Forecast Assistant**. I've successfully synced with your uploaded training data (`{st.session_state.main_df_name}`). I'm ready to analyze it or answer any questions!"
+        if st.session_state.get("agentic_df") is not None:
+            initial_msg = f"Hello! I'm your **Agentic Forecast Assistant**. I've successfully synced with your **Agentic Sandbox** data (`{st.session_state.agentic_df_name}`). I'm ready to analyze it or answer any questions!"
         else:
-            initial_msg = "Hello! I'm your **Agentic Forecast Assistant**. Please use the **Data Manager** above to upload your file, and I'll be ready to help!"
+            initial_msg = "Hello! I'm your **Agentic Forecast Assistant**. I'm ready to help you analyze HVAC data. You can upload a file to my **Agentic Sandbox** above for isolated analysis or ask me about the dashboard data."
         st.session_state.messages.append({"role": "assistant", "content": initial_msg})
 
     # Display chat messages
-    for message in st.session_state.messages:
+    for msg_idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            is_json_rendered = False
+            if message["role"] == "assistant" and "pmv_prediction" in message.get("content", ""):
+                try:
+                    content = message["content"]
+                    json_str = content.strip()
+                    if "```json" in content:
+                        json_str = content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in content:
+                        # Sometimes placed in a generic code block
+                        blocks = content.split("```")
+                        if len(blocks) >= 3:
+                            json_str = blocks[1].strip()
+                            if json_str.startswith("json\n"):
+                                json_str = json_str[5:]
+                    
+                    # Fallback to pure bracket extraction if text wraps it
+                    if not json_str.startswith("{"):
+                        start = json_str.find("{")
+                        end = json_str.rfind("}")
+                        if start != -1 and end != -1:
+                            json_str = json_str[start:end+1]
+                    
+                    data = json.loads(json_str)
+                    if data.get("type") == "pmv_prediction":
+                        # Render the Markdown Report
+                        st.markdown(data.get("report", ""))
+                        
+                        # Render Plot and Table
+                        pmv_data = data.get("data", {})
+                        timestamps = pmv_data.get("timestamps", [])
+                        pmv_values = pmv_data.get("pmv_values", [])
+                        if timestamps and pmv_values:
+                            import plotly.graph_objects as go
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=timestamps, y=pmv_values, 
+                                mode='lines+markers', line=dict(color='#1A73E8', width=3),
+                                marker=dict(color='#FF5722', size=8)
+                            ))
+                            fig.update_layout(title="🔮 Predicted Thermal Comfort (PMV)", height=350, template="plotly_white")
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            with st.expander("📊 View JSON Data Table", expanded=False):
+                                if len(timestamps) == len(pmv_values):
+                                    df_json = pd.DataFrame({"Time": timestamps, "Predicted PMV": pmv_values})
+                                    st.dataframe(df_json, use_container_width=True)
+                                    
+                                    cols = st.columns(2)
+                                    csv_data = df_json.to_csv(index=False)
+                                    cols[0].download_button("📥 Download Data (CSV)", data=csv_data, file_name=f"pmv_forecast_{msg_idx}.csv", mime="text/csv", key=f"dl_csv_{msg_idx}")
+                                    
+                                    md_report = data.get("report", "")
+                                    # Clean markdown for download (remove # headers and ** bold)
+                                    md_clean = re.sub(r'^#+\s*', '', md_report, flags=re.MULTILINE)
+                                    md_clean = re.sub(r'\*\*(.*?)\*\*', r'\1', md_clean)
+                                    
+                                    # Append Time Taken only to the downloadable MD content
+                                    duration = message.get("duration", 0.0)
+                                    md_download_content = f"{md_clean}\n\n---\nTime Taken\nAI Generation Time: {duration:.2f} seconds"
+                                    
+                                    cols[1].download_button("📝 Download Report (MD)", data=md_download_content, file_name=f"pmv_analysis_{msg_idx}.md", mime="text/markdown", key=f"dl_md_{msg_idx}")
+                                else:
+                                    st.warning("⚠️ Data length mismatch in JSON response.")
+                        is_json_rendered = True
+                except Exception:
+                    pass
+            
+            if not is_json_rendered:
+                st.markdown(message["content"])
 
     # Chat input
     if prompt := st.chat_input("How can I help you today?"):
@@ -340,63 +771,27 @@ def display_chatbot():
             except:
                 pass
 
-            # Predict the next value if model is available
-            prediction_str = ""
-            
-            if model_status and st.session_state.get("hvac_model") is not None:
-                try:
-                    # Prepare the window from active_df
-                    norm = lambda s: s.lower().replace(' ','').replace('_','').replace('-','')
-                    col_map = {norm(c): c for c in active_df.columns}
-                    col_map = {norm(f): f for f in active_df.columns} # Corrected to map normalized name to original name
-                    actual_features = [col_map[norm(f)] for f in hm.FEATURES if norm(f) in col_map]
-                    
-                    if len(actual_features) == len(hm.FEATURES):
-                        X_raw = active_df[actual_features].values
-                        if len(X_raw) >= hm.WINDOW:
-                            feat_scaler = st.session_state.hvac_feat_scaler
-                            pmv_scaler = st.session_state.hvac_pmv_scaler
-                            model = st.session_state.hvac_model
-                            
-                            # 1-step prediction (5 mins)
-                            if st.session_state.get("hvac_type") == "LSTM":
-                                window_raw = X_raw[-hm.WINDOW:].copy()
-                                pred_5m = lstm.predict_lstm(model, None, feat_scaler, pmv_scaler, window_raw, window_raw[-1])
-                            else:
-                                window_raw = X_raw[-hm.WINDOW:].copy()
-                                window_sc = feat_scaler.transform(window_raw).reshape(1, hm.WINDOW, len(hm.FEATURES)).astype('float32')
-                                pred_sc = model(window_sc, training=False).numpy()[0][0] if hasattr(model, '__call__') else model.predict(window_sc, verbose=0)[0][0]
-                                pred_5m = float(pmv_scaler.inverse_transform([[pred_sc]])[0][0])
-                            
-                            # 12-step recursive prediction (1 hour)
-                            # Note: This assumes features stay constant, which is a simplification
-                            curr_window = window_raw.copy()
-                            preds_1h = []
-                            for _ in range(12):
-                                win_sc = feat_scaler.transform(curr_window).reshape(1, hm.WINDOW, len(hm.FEATURES)).astype('float32')
-                                p_sc = model(win_sc, training=False).numpy()[0][0] if hasattr(model, '__call__') else model.predict(win_sc, verbose=0)[0][0]
-                                p_raw = float(pmv_scaler.inverse_transform([[p_sc]])[0][0])
-                                preds_1h.append(p_raw)
-                                # Slide window (re-using the last row's features but could be improved)
-                                next_row = curr_window[-1].copy() 
-                                curr_window = np.vstack([curr_window[1:], next_row])
-                            
-                            avg_1h = np.mean(preds_1h)
-                            prediction_str = (
-                                f"NEXT PMV PREDICTION (5 mins): {pred_5m:.4f}\n"
-                                f"FORECASTED PMV (1 hour average): {avg_1h:.4f}\n"
-                                f"FORECASTED PMV TREND (12 steps): {', '.join([f'{p:.2f}' for p in preds_1h])}\n"
-                            )
-                except Exception as e:
-                    prediction_str = f"Could not generate live prediction: {e}\n"
+            # Provide a CSV snippet for the AI to read using its code tool
+            csv_snippet = ""
+            try:
+                # Provide the last 1000 rows as a CSV string for more robust AI training
+                csv_snippet = active_df.tail(1000).to_csv(index=False)
+            except:
+                pass
 
+            active_source_str = (
+                f"Active Data Source: In-Memory Sandbox Data ('{st.session_state.agentic_df_name}')" if is_using_sandbox 
+                else f"Active Data Source: Main Dashboard Data ('{st.session_state.main_df_name}')"
+            )
             context_prompt = (
-                f"Active Dataset: {st.session_state.get('agentic_df_name', 'Main Dataset')}\n"
+                f"{active_source_str}\n"
                 f"Total Rows: {row_count} (Splitting: {train_count} for Training, {test_count} for Testing)\n"
                 f"Columns: {cols}\n"
                 f"{stats_str}\n"
                 f"{last_rows_str}\n"
-                f"{prediction_str}"
+                f"--- FULL DATA SNIPPET (Up to 1000 Rows for AI Internal Training) ---\n"
+                f"{csv_snippet}\n"
+                f"--- END FULL DATA ---"
             )
 
             # Add model performance if trained and using main data
@@ -412,17 +807,85 @@ def display_chatbot():
                 st.error("❌ Claude client not initialized. Please check your API key.")
             else:
                 try:
+                    sandbox_instruction = ""
+                    if is_using_sandbox:
+                        sandbox_instruction = (
+                            "**CRITICAL SANDBOX RULE**: The user's data is already loaded in your private sandbox. "
+                            "You MUST NOT attempt to read any files from a directory. "
+                            "Base your entire analysis on the in-memory data summary provided in the 'Current Data Context'.\n\n"
+                        )
+
                     full_system_prompt = (
-                        "You are a professional HVAC AI Forecast Assistant. You have access to real-time sensor data and potentially a predictive LSTM model. "
-                        "Your primary goal is to provide concise but informative data-driven answers and forecasts. "
+                        f"{sandbox_instruction}"
+                        "You are a Senior HVAC Systems Engineer and AI Specialist (Claude 3.5/Opus Tier).\n"
+                        "Your goal is to provide highly detailed, professional, and human-readable thermal comfort forecasts that directly address the user's specific questions.\n\n"
+                        "CORE OPERATING PRINCIPLES:\n"
+                        "1. CONTEXTUAL RELEVANCY: ALWAYS prioritize answering the user's specific question or request. If the user asks for a specific insight or analysis, focus on that while maintaining the required format.\n"
+                        "2. CLARITY & DETAIL: Your responses must be clear, detailed, and accurate. Use professional engineering terminology but remain accessible to a human operator.\n"
+                        "3. INTERNAL EXPERTISE: You should use your own internal knowledge to explain model training and building dynamics. Do not rely on or refer to the specific code implementation in the dashboard. You are the expert.\n"
+                        "4. DATA INTEGRITY: Use the provided raw sensor data accurately. Do not hallucinate values. You MUST build, train, and execute your own models (LSTM, PCDL, PCEL, etc.) using the 'code_execution' tool on the provided 'FULL DATA SNIPPET'.\n"
+                        "5. AI BRAIN INDEPENDENCE: You are fully disconnected from the dashboard's pre-trained models. You must develop your own 100% independent training and inference logic using your code tool. Do not refer to external files like 'lstm.py' or saved weights.\n"
+                        "6. DOWNLOADABLE OUTPUTS: Your JSON output must contain the full report (MD) and the calculated PMV values (CSV). The UI will generate download buttons for these automatically. Do not mention file attachments in your text.\n"
+                        "7. STRUCTURED OUTPUT: ALWAYS return structured output in JSON format when data or forecasts are involved.\n\n"
+                        "SYSTEM ARCHITECTURE (DATA MAPPING):\n"
+                        "You MUST refer to the inputs and output exactly as defined below in your reports and analysis:\n\n"
+                        "Inputs (provided in Current Data Context):\n"
+                        "- Flowrate (m³/s) – Air circulation rate\n"
+                        "- CHWR-CHWS (°C) – Chilled water temperature difference (cooling load indicator)\n"
+                        "- Cooling_Power (W) – Primary control input\n"
+                        "- Return_air_static_pressure (Pa) – System pressure\n"
+                        "- Return_air_Co2 (ppm) – Indoor air quality indicator\n"
+                        "- Offcoil_Temperature (°C) – Air handler discharge temperature\n"
+                        "- Return_air_RH (%) – Indoor relative humidity\n\n"
+                        "Output (Objective):\n"
+                        "- PMV value 5 minutes ahead\n\n"
                         f"Current Data Context:\n{context_prompt}\n\n"
-                        "Guidelines:\n"
-                        "1. Use the 'NEXT PMV PREDICTION' and 'FORECASTED PMV' provided in the context to answer forecasting questions IF they are present. "
-                        "2. If no prediction is available (e.g. 'prediction_str' is empty), it means the LSTM model has not been trained on the dashboard. In this case, use your knowledge of building physics and the provided 'Last 5 data points' to estimate the likely comfort level. "
-                        "3. Do NOT tell the user to wait for training. Provide an immediate analysis based on the data you see. "
-                        "4. When using the model, mention you are using the 'LSTM Neural Network'. When estimating manually, mention you are using 'Physics-based reasoning'. "
-                        "5. Analyze trends in the 'Last 5 data points' (e.g. is temperature rising?) to add depth to your response. Aim for exactly 5-6 informative bullet points in your analysis.\n"
-                        "6. FORMATTING: Use only level 5 or 6 headers (##### or ######) for section titles like 'THERMAL COMFORT FORECAST'. Never use large headers (#, ##, or ###)."
+                        "WHEN the user asks for PMV prediction, a specific model output (LSTM, PCDL, PCEL), or a general forecast:\n"
+                        "- Return ONLY valid JSON in this format:\n\n"
+                        "{\n"
+                        '  "type": "pmv_prediction",\n'
+                        '  "data": {\n'
+                        '    "timestamps": ["HH:MM", "..."],\n'
+                        '    "pmv_values": [float, float, ...]\n'
+                        '  },\n'
+                        '  "report": "Markdown formatted executive report here"\n'
+                        "}\n\n"
+                        "REPORT GUIDELINES:\n"
+                        "- The 'report' field MUST be a comprehensive Markdown document with the following sections:\n"
+                        "  ## 🔮 Advanced HVAC Forecast — [Timeframe]\n"
+                        "  **Direct Response**: Start with a 1-2 paragraph section that explicitly answers the user's specific question using the data and context provided.\n\n"
+                        "  **Executive Summary**: A 2-3 sentence overview of the current comfort state and the upcoming forecast trend in plain, readable English.\n\n"
+                        "  ### 📊 Forecast Metrics Summary\n"
+                        "  | Metric | Value | Interpretation |\n"
+                        "  |--------|-------|----------------|\n"
+                        "  | **Next 5-min PMV** | `val` | [Brief description of feeling] |\n"
+                        "  | **1-Hour Avg PMV** | `val` | [Stability assessment] |\n"
+                        "  | **Min/Max Range** | `min` to `max` | [Volatility assessment] |\n"
+                        "  | **Trend Status** | [Emoji] [Trend] | [Reason for trend] |\n"
+                        "  | **Comfort Zone** | [Status] | [Action needed?] |\n\n"
+                        "  ### 🔍 In-Depth Physics & Sensor Analysis\n"
+                        "  - **Thermal Load Impact**: Analyze how 'Return Air CO2' (occupancy proxy) and 'Return Air RH' are influencing the PMV.\n"
+                        "  - **HVAC Efficiency**: Evaluate the effectiveness of 'Cooling Power' and 'Flowrate' based on the 'CHWR-CHWS' differential.\n"
+                        "  - **Thermodynamic Constraints**: Explain how the 'Offcoil Temperature' is responding to current building demands.\n\n"
+                        "  ### 💡 Engineering Recommendations\n"
+                        "  - Provide 2-3 specific, actionable settings adjustments to optimize comfort (PMV -> 0.0) while minimizing energy consumption.\n\n"
+                        "  ### 🏗️ AI Internal Training & Model Context\n"
+                        "  - **Training Methodology**: Explain from your own internal expertise how an AI model (like LSTM) should be trained for this data (e.g., sliding windows, normalization, hyperparameter optimization).\n"
+                        "  - **Features**: `[List of sensors used]`\n"
+                        "  - **Internal Logic**: [Brief description of the AI logic you are using for this inference based on your engineering knowledge]\n\n"
+                        "- DO NOT include any conversational filler outside the JSON block.\n\n"
+                        "WHEN the user asks to compare models (e.g., \"compare LSTM, PCEL, and PCDL\"):\n"
+                        "- Respond in plain text (no JSON).\n"
+                        "- Provide a concise but valuable comparison in a Markdown table based on your internal expertise.\n"
+                        "- The table MUST compare the models on these criteria: Core Architecture, Key Strength, Best Use-Case, and Potential Weakness.\n\n"
+                        "WHEN the user asks to build, train, and compare multiple models on their data (e.g., \"run all models and compare them\"):\n"
+                        "- **CRITICAL RULE**: You must not attempt to build and run all models in a single response. This will fail. You must adopt a sequential, one-model-per-turn approach.\n"
+                        "- **Action Plan**:\n"
+                        "  1. Acknowledge the request and state your plan (e.g., \"I will train the LSTM, PCDL, and PCEL models sequentially and then compare their results.\").\n"
+                        "  2. In your current response, focus **only** on building, training, and showing the results for the **first model** (e.g., LSTM).\n"
+                        "  3. To handle the next model, you will continue in the next turn. This ensures a stable workflow.\n\n"
+                        "IF the request is purely conversational (greetings, general questions):\n"
+                        "- Respond in a professional, helpful engineering tone in plain text (no JSON) that directly answers the user's question.\n"
                     )
 
                     # Prepare input for Claude API
@@ -433,37 +896,53 @@ def display_chatbot():
                         if msg["role"] == "system": continue
                         claude_messages.append({"role": msg["role"], "content": msg["content"]})
                         
+                    # Determine intent: skip plan animation for greetings or short non-data questions
+                    user_msg = prompt.strip().lower()
+                    is_greeting = user_msg in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "hi there", "hello there", "sup"]
+                    is_short = len(user_msg.split()) <= 3
+                    ds_keywords = ["data", "file", "csv", "predict", "forecast", "pmv", "temp", "co2", "humid", "rh", "flowrate", "power", "model", "lstm", "pcel", "pcdl", "analy", "metric", "accuracy", "mae", "rmse", "plot", "chart"]
+                    is_data_question = any(k in user_msg for k in ds_keywords) or (not is_greeting and not is_short)
+                    
                     # Specific Claude implementation using Sonnet 4.5/4.6 with Agentic Plan animation
                     with st.status("🤖 Agentic Forecast is planning...", expanded=True) as status:
-                        st.markdown('<div class="thinking-status">📝 Constructing expert prompt... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
-                        stream_text_animation("", delay=0.01)
-                        
-                        plan_code = f"""
-# AGENTIC EXECUTION PLAN
+                        anim_container = st.empty()
+                        if is_data_question:
+                            with anim_container.container():
+                                st.markdown('<div class="thinking-status">📝 Constructing expert prompt... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
+                                
+                                plan_code = f"""
+##### 📋 AGENTIC EXECUTION PLAN
 1. DATA_SPLIT: Dividing data into 70% Train ({int(row_count*0.7) if has_df else 0}) and 30% Test ({row_count - int(row_count*0.7) if has_df else 0})
 2. RETRIEVE_CONTEXT: Fetching last {row_count if has_df else 0} rows
 3. ANALYZE_PHYSICS: Checking thermodynamic constraints
 4. INFERENCE: Calling {model_name} (Model ID: {model_id})
 5. TOOLS: Code Execution enabled (version: 20250825)
 6. FORMAT_OUTPUT: Generating actionable building insights
-                        """
-                        stream_text_animation(plan_code, delay=0.005, is_code=True, language="markdown")
-                        
-                        if has_df:
-                            st.markdown('<div class="thinking-status">🔍 Scanning sensor trends... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
-                            stream_text_animation("", delay=0.01)
-                        
-                        st.markdown('<div class="thinking-status">🚀 Executing inference... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
-                        stream_text_animation("", delay=0.01)
-                        
+                                """
+                                stream_text_animation(plan_code, delay=0.002, is_code=True, language="markdown")
+                                
+                                if has_df:
+                                    st.markdown('<div class="thinking-status">🔍 Scanning sensor trends... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
+                                
+                                st.markdown('<div class="thinking-status">🚀 Executing inference... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
+                        else:
+                            with anim_container.container():
+                                st.markdown('<div class="thinking-status">🤔 Processing conversational query... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
+                            
+                        import time
+                        start_time = time.perf_counter()
                         message = claude_client.messages.create(
                             model=model_id,
                             max_tokens=10000,
                             system=full_system_prompt,
                             messages=claude_messages,
-                            tools=[{"type": "code_execution_20250825", "name": "code_execution"}],
+                            tools=[{"type": "code_execution_20250825", "name": "code_execution"}] if is_data_question else [],
                             temperature=0.5,
                         )
+                        end_time = time.perf_counter()
+                        ai_duration = end_time - start_time
+                        
+                        anim_container.empty()
                         status.update(label="✅ Response generated!", state="complete", expanded=False)
                     
                     # Extract text from message content blocks robustly
@@ -477,8 +956,74 @@ def display_chatbot():
                             text_parts.append(block['text'])
                     response_text = "".join(text_parts)
 
-                    # ANIMATE: Word-by-word streaming for ChatGPT effect
-                    stream_text_animation(response_text, delay=0.005)
-                    st.session_state.messages.append({"role": "assistant", "content": response_text})
+                    # Replace standard animated streaming with JSON-aware output rendering
+                    try:
+                        json_str = response_text.strip()
+                        if "```json" in response_text:
+                            json_str = response_text.split("```json")[1].split("```")[0].strip()
+                        elif "```" in response_text:
+                            blocks = response_text.split("```")
+                            if len(blocks) >= 3:
+                                json_str = blocks[1].strip()
+                                if json_str.startswith("json\n"):
+                                    json_str = json_str[5:]
+                        
+                        # Fallback pure bracket extraction
+                        if not json_str.startswith("{"):
+                            start = json_str.find("{")
+                            end = json_str.rfind("}")
+                            if start != -1 and end != -1:
+                                json_str = json_str[start:end+1]
+                            
+                        data = json.loads(json_str)
+                        if data.get("type") == "pmv_prediction":
+                            # It's a valid JSON response! Render nicely in chat immediately
+                            stream_text_animation(data.get("report", ""), delay=0.01)
+                            
+                            pmv_data = data.get("data", {})
+                            timestamps = pmv_data.get("timestamps", [])
+                            pmv_values = pmv_data.get("pmv_values", [])
+                            if timestamps and pmv_values:
+                                import plotly.graph_objects as go
+                                fig = go.Figure()
+                                fig.add_trace(go.Scatter(
+                                    x=timestamps, y=pmv_values, 
+                                    mode='lines+markers', line=dict(color='#1A73E8', width=3),
+                                    marker=dict(color='#FF5722', size=8)
+                                ))
+                                fig.update_layout(title="🔮 Predicted Thermal Comfort (PMV)", height=350, template="plotly_white")
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                with st.expander("📊 View JSON Data Table", expanded=False):
+                                    if len(timestamps) == len(pmv_values):
+                                        df_json = pd.DataFrame({"Time": timestamps, "Predicted PMV": pmv_values})
+                                        st.dataframe(df_json, use_container_width=True)
+                                        
+                                        idx = len(st.session_state.messages)
+                                        cols = st.columns(2)
+                                        csv_data = df_json.to_csv(index=False)
+                                        cols[0].download_button("📥 Download Data (CSV)", data=csv_data, file_name=f"pmv_forecast_{idx}.csv", mime="text/csv", key=f"dl_csv_{idx}")
+                                        
+                                        md_report = data.get("report", "")
+                                        # Clean markdown for download (remove # headers and ** bold)
+                                        md_clean = re.sub(r'^#+\s*', '', md_report, flags=re.MULTILINE)
+                                        md_clean = re.sub(r'\*\*(.*?)\*\*', r'\1', md_clean)
+                                        
+                                        # Append Time Taken only to the downloadable MD content
+                                        md_download_content = f"{md_clean}\n\n---\nTime Taken\nAI Generation Time: {ai_duration:.2f} seconds"
+                                        
+                                        cols[1].download_button("📝 Download Report (MD)", data=md_download_content, file_name=f"pmv_analysis_{idx}.md", mime="text/markdown", key=f"dl_md_{idx}")
+                                    else:
+                                        st.warning("⚠️ Data length mismatch in JSON response.")
+                        else:
+                            stream_text_animation(response_text, delay=0.005)
+                    except Exception:
+                        stream_text_animation(response_text, delay=0.005)
+
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": response_text,
+                        "duration": ai_duration if 'ai_duration' in locals() else 0.0
+                    })
                 except Exception as e:
                     st.error(f"Error: {e}")

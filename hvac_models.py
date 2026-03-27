@@ -129,7 +129,8 @@ def prepare_hvac_data(df, train_ratio=TRAIN_RATIO):
         return None, None, None, None, None, None, None, None, \
                f"Missing target column: {TARGET}"
     
-    data = df[mapped_features + [target_col]].dropna().reset_index(drop=True)
+    data = df[mapped_features + [target_col]].copy()
+    data = data.interpolate(method='linear', limit=6, limit_direction='both').dropna().reset_index(drop=True)
     X_raw = data[mapped_features].values
     y_raw = data[target_col].values
     

@@ -20,6 +20,7 @@ import plotly.express as px
 
 import hvac_models as hm
 import lstm
+import pcel
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────
 st.set_page_config(
@@ -60,6 +61,8 @@ if "model_bias" not in st.session_state:
     st.session_state.model_bias = 0.0
 if "model_mape" not in st.session_state:
     st.session_state.model_mape = 0.0
+if "model_ci_width" not in st.session_state:
+    st.session_state.model_ci_width = 0.0
 if "main_df" not in st.session_state:
     st.session_state.main_df = None
 if "main_df_name" not in st.session_state:
@@ -84,6 +87,17 @@ def reset_app_state():
     st.session_state.agentic_df = None
     st.session_state.agentic_df_name = ""
     st.session_state.last_main_func = "Select"
+
+def clear_model_results():
+    """Clear previous model training and test results when switching models."""
+    st.session_state.model_trained = False
+    st.session_state.test_data_loaded = False
+    st.session_state.test_df_results = None
+    st.session_state.test_metrics = {}
+    st.session_state.model_mae = 0.0
+    st.session_state.model_rmse = 0.0
+    st.session_state.model_r2 = 0.0
+    st.session_state.pcel_variant_metrics = None
 
 # ── CONFIG FROM hvac_models ───────────────────────────────────────
 HVAC_FEATURES = hm.FEATURES    # single source of truth — never redefine
@@ -208,15 +222,40 @@ def train_selected_model(df, model_type="LSTM"):
     try:
         if model_type == "PCDL":
             model, history = pc.train_pcdl(X_train_w, y_train_w, X_test_w, y_test_w)
+        elif model_type == "PCEL":
+            # PCEL trains 5 variants internally and returns a wrapper
+            model, history, feat_scaler, pmv_scaler, pcel_metrics, variant_metrics = pcel.train_pcel(df)
+            # Override metrics with ensemble-specific results
+            mae, rmse, r2, bias, mape, ci_width = (
+                pcel_metrics['mae'], pcel_metrics['rmse'], pcel_metrics['r2'], 
+                pcel_metrics['violations'], pcel_metrics['mape'], 0.0
+            )
+            preds_raw = pcel_metrics['preds_real']
         else:
             model, history = hm.train_lstm(X_train_w, y_train_w, X_test_w, y_test_w)
         
-        # Guard: Only predict if we have test data in this file
-        if X_test_w is not None and getattr(X_test_w, "size", 0) > 0:
-            preds_sc = model.predict(X_test_w, verbose=0)
-            preds_raw, mae, rmse, r2, bias, mape = hm.evaluate_model(y_test_raw_w, preds_sc, pmv_scaler)
-        else:
-            preds_raw, mae, rmse, r2, bias, mape = np.array([]), 0.0, 0.0, 0.0, 0.0, 0.0
+        # Guard: Only predict if we have test data in this file (Skip for PCEL as it already evaluated)
+        if model_type != "PCEL":
+            if X_test_w is not None and getattr(X_test_w, "size", 0) > 0:
+                preds_sc = model.predict(X_test_w, verbose=0)
+                preds_raw, mae, rmse, r2, bias, mape = hm.evaluate_model(y_test_raw_w, preds_sc, pmv_scaler)
+                
+                # Confidence Interval via MC Dropout
+                try:
+                    mc_preds = []
+                    for _ in range(30):
+                        p = model(X_test_w, training=True)
+                        mc_preds.append(p.numpy().flatten())
+                    mc_sc = np.array(mc_preds)
+                    lower_sc = np.percentile(mc_sc, 2.5, axis=0)
+                    upper_sc = np.percentile(mc_sc, 97.5, axis=0)
+                    lower_raw = pmv_scaler.inverse_transform(lower_sc.reshape(-1, 1)).flatten()
+                    upper_raw = pmv_scaler.inverse_transform(upper_sc.reshape(-1, 1)).flatten()
+                    ci_width = float(np.mean(upper_raw - lower_raw))
+                except Exception:
+                    ci_width = 0.0
+            else:
+                preds_raw, mae, rmse, r2, bias, mape, ci_width = np.array([]), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             
         return {
             'model': model,
@@ -228,11 +267,13 @@ def train_selected_model(df, model_type="LSTM"):
             'r2_test': r2,
             'bias_test': bias,
             'mape_test': mape,
+            'ci_width_test': ci_width,
             'history': history,
             'preds_raw': preds_raw,
             'y_test_raw': y_test_raw_w,
             'error': None,
-            'has_test_results': len(preds_raw) > 0
+            'has_test_results': len(preds_raw) > 0,
+            'variant_metrics': variant_metrics if model_type == "PCEL" else None
         }
     
     except Exception as e:
@@ -270,18 +311,18 @@ with st.sidebar:
         key     = f"gcp_select_{st.session_state.reset_counter}"
     )
     
-    model_name = st.selectbox(
+    model_choice = st.selectbox(
         label   = "Select Model",
-        options = ["Claude Sonnet 4.5", "Claude Sonnet 4.6", "Claude Opus 4.6"],
-        index   = 0,
+        options = ["Select Model", "Claude Sonnet 4.5", "Claude Sonnet 4.6", "Claude Opus 4.6"],
+        label_visibility = "collapsed",
         key     = f"model_select_{st.session_state.reset_counter}"
     )
     
     # Mapping requested labels to latest available Claude 4.x model IDs
-    if "Opus" in model_name:
+    if "Opus" in model_choice:
         model_id = "claude-opus-4-6"
     else:
-        model_id = "claude-sonnet-4-6" if "4.6" in model_name else "claude-sonnet-4-5"
+        model_id = "claude-sonnet-4-6" if "4.6" in model_choice else "claude-sonnet-4-5"
 
     st.markdown("<div style='margin-top: -5px;'></div>", unsafe_allow_html=True)
     st.button("Clear/Reset", key="reset_btn", on_click=reset_app_state)
@@ -340,13 +381,27 @@ if nav_choice == "Reports":
         r2   = tm.get('r2', st.session_state.get('model_r2', 0.0))
         bias = tm.get('residual_sum', st.session_state.get('model_bias', 0.0))
         mape = tm.get('mape', st.session_state.get('model_mape', 0.0))
+        ci   = tm.get('ci_width', st.session_state.get('model_ci_width', 0.0))
         
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("MAE", f"{mae:.4f}", help="Mean Absolute Error (Lower is better)")
-        m2.metric("RMSE", f"{rmse:.4f}", help="Root Mean Squared Error (Lower is better)")
-        m3.metric("R² Score", f"{r2:.4f}", help="Coefficient of Determination (Higher is better)")
-        m4.metric("Bias (Sum)", f"{bias:.4f}", help="Total Sum of Errors (Actual - Predicted)")
+        m1.metric("MAE", f"{mae:.4f}", help="Mean Absolute Error")
+        m2.metric("RMSE", f"{rmse:.4f}", help="Root Mean Squared Error")
+        m3.metric("R² Score", f"{r2:.4f}", help="Coefficient of Determination")
+        m4.metric("Bias (Sum)", f"{bias:.4f}", help="Total Sum of Errors")
         m5.metric("MAPE (%)", f"{mape:.2f}%", help="Mean Absolute Percentage Error")
+        
+        ci_val = ci / 2
+        df = st.session_state.get("main_df")
+        if df is not None:
+            test_size = len(df) - int(len(df) * 0.7)
+            row_str = f"your **{test_size} rows** of evaluated test data"
+        else:
+            row_str = "the evaluated test data"
+        
+        if ci_val < 0.20:
+            st.info(f"**95% CI Width (±{ci_val:.4f}) - High Confidence:** The model is highly confident in its predictions because it found strong, consistent thermodynamic patterns in {row_str}.")
+        else:
+            st.warning(f"**95% CI Width (±{ci_val:.4f}) - Uncertainty Detected:** The model is somewhat uncertain. It is struggling to find clear patterns in {row_str}.\n\n**Solutions to improve confidence:**\n- **Increase Training Data:** Upload a file with more historical records (currently {len(df) if df is not None else 0} total rows).\n- **Check for Anomalies:** Look for extreme sensor spikes or broken sensor readings in your dataset.\n- **Data Consistency:** Ensure HVAC states (like Cooling Power) aren't fluctuating wildly without corresponding changes in the environment.")
         
         st.info("💡 Model reporting data derived from combined training and test sequence evaluation.")
     else:
@@ -366,9 +421,14 @@ else: # nav_choice == "Home"
                 unsafe_allow_html=True
             )
         with sf_col2:
+            # Get the index based on persisted state
+            options = ["Select", "Thermal Comfort Forecasting"]
+            default_index = options.index(st.session_state.last_main_func) if st.session_state.last_main_func in options else 0
+            
             main_func = st.selectbox(
                 label = "",
-                options = ["Select", "Thermal Comfort Forecasting"],
+                options = options,
+                index = default_index,
                 label_visibility = "collapsed",
                 key = f"main_func_select_{st.session_state.reset_counter}"
             )
@@ -388,12 +448,25 @@ else: # nav_choice == "Home"
                 unsafe_allow_html=True
             )
             with up_col2:
-                uploaded_file = st.file_uploader(
-                    label = "",
-                    type  = ["csv", "xlsx", "xls"],
-                    key   = f"uploaded_file_{st.session_state.reset_counter}",
-                    label_visibility = "collapsed",
-                )
+                if st.session_state.get("main_df") is not None:
+                    st.success(f"📂 **Current Training File:** {st.session_state.main_df_name}")
+                    if st.button("Upload New File", key=f"clear_train_btn_{st.session_state.reset_counter}"):
+                        st.session_state.main_df = None
+                        st.session_state.main_df_name = ""
+                        st.session_state.data_preprocessed = False
+                        st.session_state.insights_generated = False
+                        st.session_state.show_eda = False
+                        st.session_state.model_trained = False
+                        if "last_file_key" in st.session_state:
+                            del st.session_state.last_file_key
+                        st.rerun()
+                else:
+                    uploaded_file = st.file_uploader(
+                        label = "",
+                        type  = ["csv", "xlsx", "xls"],
+                        key   = f"uploaded_file_{st.session_state.reset_counter}",
+                        label_visibility = "collapsed",
+                    )
     elif func_choice == "Select Functionality":
         st.info("👈 **Please select a Functionality from the sidebar to begin.**")
     elif service_choice == "Select the Service":
@@ -471,7 +544,7 @@ else: # nav_choice == "Home"
             st.markdown("<div style='margin-bottom:30px;'></div>", unsafe_allow_html=True)
             pp_col1, pp_col2 = st.columns([2, 1])
             with pp_col1:
-                st.markdown("<h3 style='margin-top:0px;'>⚙️ Data Preprocessing</h3>", unsafe_allow_html=True)
+                st.markdown("<h3 style='margin-top:0px;'>Data Preprocessing</h3>", unsafe_allow_html=True)
             with pp_col2:
                 st.markdown('<div class="preprocess-btn-container">', unsafe_allow_html=True)
                 start_pp = st.button("🛠️ Start Preprocessing",
@@ -538,15 +611,15 @@ else: # nav_choice == "Home"
                     st.markdown('</div>', unsafe_allow_html=True)
 
                 if gen_ai:
-                    with st.status(f"🤖 Claude ({model_name}) is planning your analysis...", expanded=True) as status:
+                    with st.status(f" Claude ({model_choice}) is planning your analysis...", expanded=True) as status:
                         st.markdown('<div class="thinking-status">📑 Drafting analysis protocol... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
                         ag.stream_text_animation("", delay=0.01)
                         
                         plan_code = f"""
-# ANALYSIS EXECUTION PLAN
+**📋 ANALYSIS EXECUTION PLAN**
 1. SCAN_HISTORY: Reading latest {len(df)} data points
 2. CALCULATE_PHYSICS: Analyzing thermodynamic correlations
-3. INFERENCE: Calling {model_name} (Model ID: {model_id})
+3. INFERENCE: Calling {model_choice} (Model ID: {model_id})
 4. TOOLS: Code Execution enabled (version: 20250825)
 5. GENERATE_INSIGHTS: Extracting building efficiency optimizations
 6. OPTIMIZE_VALUES: Determining PMV=0 settings
@@ -592,19 +665,27 @@ else: # nav_choice == "Home"
                         unsafe_allow_html=True
                     )
                 with ms_col2:
+                    if "last_hvac_model_choice" not in st.session_state:
+                        st.session_state.last_hvac_model_choice = "Select Model"
+                    model_options = ["Select Model", "LSTM", "PCEL", "PCDL", "Agentic Forecast"]
+                    default_mod_idx = model_options.index(st.session_state.last_hvac_model_choice) if st.session_state.last_hvac_model_choice in model_options else 0
+                    
                     hvac_model_choice = st.selectbox(
                         label = "Select Model",
-                        options = ["Select Model", "LSTM", "PCEL", "PCDL", "Agentic Forecast"],
+                        options = model_options,
+                        index = default_mod_idx,
                         label_visibility = "collapsed",
-                        key = "hvac_model_choice_select"
+                        key = "hvac_model_choice_select",
+                        on_change = clear_model_results
                     )
+                    st.session_state.last_hvac_model_choice = hvac_model_choice
 
                 if hvac_model_choice == "Agentic Forecast":
                     st.markdown("---")
                     st.markdown("##### 🤖 Agentic Forecast (AI Assistant)")
                     ag.display_chatbot()
 
-                if hvac_model_choice in ["LSTM", "PCDL"]:
+                if hvac_model_choice in ["LSTM", "PCDL", "PCEL"]:
                     st.markdown("<div style='margin-bottom:20px;'></div>", unsafe_allow_html=True)
                     tr_col1, tr_col2 = st.columns([1, 2])
                     with tr_col1:
@@ -643,6 +724,8 @@ else: # nav_choice == "Home"
                                 st.session_state.model_r2         = result['r2_test']
                                 st.session_state.model_bias       = result['bias_test']
                                 st.session_state.model_mape       = result['mape_test']
+                                st.session_state.model_ci_width   = result['ci_width_test']
+                                st.session_state.pcel_variant_metrics = result.get('variant_metrics')
                                 
                                 # Store real last 12 readings
                                 X_raw = df[HVAC_FEATURES].values
@@ -666,12 +749,21 @@ else: # nav_choice == "Home"
                         unsafe_allow_html=True
                     )
                 with td_col2:
-                    test_file = st.file_uploader(
-                        label = "Upload Test Data",
-                        type  = ["csv", "xlsx", "xls"],
-                        key   = f"test_file_{st.session_state.reset_counter}",
-                        label_visibility = "collapsed",
-                    )
+                    test_file = None
+                    if st.session_state.get("test_data_loaded"):
+                        st.success("📂 **Test Data Loaded & Evaluated**")
+                        if st.button("Upload New Test File", key=f"clear_test_btn_{st.session_state.reset_counter}"):
+                            st.session_state.test_data_loaded = False
+                            st.session_state.test_df_results = None
+                            st.session_state.test_metrics = {}
+                            st.rerun()
+                    else:
+                        test_file = st.file_uploader(
+                            label = "Upload Test Data",
+                            type  = ["csv", "xlsx", "xls"],
+                            key   = f"test_file_{st.session_state.reset_counter}",
+                            label_visibility = "collapsed",
+                        )
                     
                     test_df = None
                     if test_file is not None:
@@ -712,10 +804,10 @@ else: # nav_choice == "Home"
                                     current_history = np.vstack([current_history[1:], new_input])
 
                                 test_clean['Actual PMV (Data)'] = actual_pmv_list
-                                test_clean[f'AI Forecast PMV ({st.session_state.hvac_type})'] = forecast_pmv_list
-                                test_clean['Residual (Difference)'] = test_clean['Actual PMV (Data)'] - test_clean[f'AI Forecast PMV ({st.session_state.hvac_type})']
+                                test_clean['AI Forecast PMV'] = forecast_pmv_list
+                                test_clean['Residual (Difference)'] = test_clean['Actual PMV (Data)'] - test_clean['AI Forecast PMV']
                                 test_clean['Comfort Status (Data)'] = test_clean['Actual PMV (Data)'].apply(hm.get_comfort_descriptor)
-                                test_clean['Comfort Status (AI)'] = test_clean[f'AI Forecast PMV ({st.session_state.hvac_type})'].apply(hm.get_comfort_descriptor)
+                                test_clean['Comfort Status (AI)'] = test_clean['AI Forecast PMV'].apply(hm.get_comfort_descriptor)
                                 
                                 st.session_state.test_df_results = test_clean
                                 
@@ -724,15 +816,37 @@ else: # nav_choice == "Home"
                                 forecasts = np.array(forecast_pmv_list)
                                 
                                 # Designate hvac_models as the single source of truth for metrics
-                                # We pass a dummy scaled array because evaluate_model expects scaled predictions 
-                                # to inverse scale them, but since we already have forecast_pmv_list (raw),
-                                # we can just use the internal calculation if we modify it to accept raw.
-                                # However, to follow the current hm.evaluate_model signature:
                                 _, mae, rmse, r2, bias, mape = hm.evaluate_model(
                                     actuals, 
                                     pmv_scaler.transform(forecasts.reshape(-1,1)).ravel(), 
                                     pmv_scaler
                                 )
+                                
+                                # Confidence Interval via MC Dropout for test data
+                                try:
+                                    X_test_all = []
+                                    curr = st.session_state.last_12_raw.copy()
+                                    for idx, row in test_clean.iterrows():
+                                        x_w = feat_scaler.transform(curr).reshape(WINDOW, len(HVAC_FEATURES))
+                                        X_test_all.append(x_w)
+                                        # slide
+                                        row_dict = {f: row[col_map[norm(f)]] for f in HVAC_FEATURES}
+                                        new_inp = np.array([row_dict[f] for f in HVAC_FEATURES], dtype='float32')
+                                        curr = np.vstack([curr[1:], new_inp])
+                                    
+                                    X_test_all = np.array(X_test_all).astype('float32')
+                                    mc_preds = []
+                                    for _ in range(30):
+                                        p = model(X_test_all, training=True)
+                                        mc_preds.append(p.numpy().flatten())
+                                    mc_sc = np.array(mc_preds)
+                                    lower_sc = np.percentile(mc_sc, 2.5, axis=0)
+                                    upper_sc = np.percentile(mc_sc, 97.5, axis=0)
+                                    lower_raw = pmv_scaler.inverse_transform(lower_sc.reshape(-1, 1)).flatten()
+                                    upper_raw = pmv_scaler.inverse_transform(upper_sc.reshape(-1, 1)).flatten()
+                                    ci_width = float(np.mean(upper_raw - lower_raw))
+                                except Exception:
+                                    ci_width = 0.0
                                 
                                 st.session_state.test_metrics = {
                                     'mae': mae,
@@ -740,6 +854,7 @@ else: # nav_choice == "Home"
                                     'r2': r2,
                                     'residual_sum': bias,
                                     'mape': mape,
+                                    'ci_width': ci_width,
                                     'no_target': target_col_test is None
                                 }
 
@@ -756,12 +871,12 @@ else: # nav_choice == "Home"
                         **What the colors mean:**
                         *   🟦 **Blue/Cool**: Feeling Cold | ⬜ **Comfortable** | 🟥 **Warm**: Feeling Hot
                     """)
-                    display_cols = ['Actual PMV (Data)', 'Comfort Status (Data)', f'AI Forecast PMV ({st.session_state.hvac_type})', 'Comfort Status (AI)', 'Residual (Difference)']
+                    display_cols = ['Actual PMV (Data)', 'Comfort Status (Data)', 'AI Forecast PMV', 'Comfort Status (AI)', 'Residual (Difference)']
                     st.dataframe(test_clean[display_cols].style.format({
                         'Actual PMV (Data)': "{:.2f}",
-                        f'AI Forecast PMV ({st.session_state.hvac_type})': "{:.2f}",
+                        'AI Forecast PMV': "{:.2f}",
                         'Residual (Difference)': "{:.2f}"
-                    }).background_gradient(cmap="coolwarm", subset=['Actual PMV (Data)', f'AI Forecast PMV ({st.session_state.hvac_type})', 'Residual (Difference)']), 
+                    }).background_gradient(cmap="coolwarm", subset=['Actual PMV (Data)', 'AI Forecast PMV', 'Residual (Difference)']), 
                     use_container_width=True)
                     
                     # --- NEW INTERACTIVE PLOTLY CHART ---
@@ -773,7 +888,7 @@ else: # nav_choice == "Home"
                         line=dict(color='#1A73E8', width=3)
                     ))
                     fig.add_trace(go.Scatter(
-                        y=test_clean[f'AI Forecast PMV ({st.session_state.hvac_type})'].values,
+                        y=test_clean['AI Forecast PMV'].values,
                         mode='lines',
                         name='AI Forecast PMV',
                         line=dict(color='#D81B60', width=3, dash='dash')
@@ -799,3 +914,34 @@ else: # nav_choice == "Home"
                     m3.metric(label="R² Score", value=f"{metrics['r2']:.4f}", help="Coefficient of Determination (Higher is better)")
                     m4.metric(label="Bias (Sum)", value=f"{metrics['residual_sum']:.4f}", help="Total Sum of Errors (Actual - Predicted)")
                     m5.metric(label="MAPE (%)", value=f"{metrics['mape']:.2f}%", help="Mean Absolute Percentage Error")
+                    
+                    # PCEL Variant Comparison Table
+                    if st.session_state.get('pcel_variant_metrics'):
+                        st.markdown("---")
+                        st.markdown("#### 📊 Final Comparison Table (PCEL Ensemble vs Variants)")
+                        comp_data = []
+                        for name, m in st.session_state.pcel_variant_metrics.items():
+                            comp_data.append({
+                                "Model Version": name,
+                                "MAE": m['mae'],
+                                "RMSE": m['rmse'],
+                                "R²": m['r2'],
+                                "MAPE (%)": m['mape'],
+                                "Violations": m.get('violations', 0)
+                            })
+                        comp_df = pd.DataFrame(comp_data)
+                        st.dataframe(comp_df.style.format({
+                            'MAE': "{:.4f}",
+                            'RMSE': "{:.4f}",
+                            'R²': "{:.4f}",
+                            'MAPE (%)': "{:.2f}%"
+                        }), use_container_width=True)
+                    
+                    ci_val = metrics.get('ci_width', 0.0) / 2
+                    df = st.session_state.get("main_df")
+                    row_str = f"your **{len(df)} rows** of active data" if df is not None else "the uploaded data"
+                    
+                    if ci_val < 0.20:
+                        st.info(f"**95% CI Width (±{ci_val:.4f}) - High Confidence:** The model is highly confident in its predictions because it found strong, consistent thermodynamic patterns in {row_str}.")
+                    else:
+                        st.warning(f"**95% CI Width (±{ci_val:.4f}) - Uncertainty Detected:** The model is somewhat uncertain. It is struggling to find clear patterns in {row_str}.\n\n**Solutions to improve confidence:**\n- **Increase Training Data:** Upload a file with more historical records (currently {len(df) if df is not None else 0} rows).\n- **Check for Anomalies:** Look for extreme sensor spikes or broken sensor readings in your dataset.\n- **Data Consistency:** Ensure HVAC states (like Cooling Power) aren't fluctuating wildly without corresponding changes in the environment.")
