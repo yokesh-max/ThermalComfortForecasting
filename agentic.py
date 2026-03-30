@@ -8,9 +8,12 @@ import time
 import base64
 from anthropic import Anthropic
 from dotenv import load_dotenv
-import hvac_models as hm
-import lstm
+from MODELS import lstm
 import re
+
+def estimate_pmv_from_sensors(row_dict):
+    """Placeholder estimator — Fanger formula is not used."""
+    return 0.0
 
 # ── ENV & CLAUDE ──────────────────────────────────────────────────
 load_dotenv()
@@ -62,11 +65,16 @@ def get_ai_insights(df, latest_reading, model_id="claude-sonnet-4-5"):
         return "Claude client not initialised. Check your API key.", None
         
     stats_str = ""
+    FEATURES = [
+        'Cooling_Power', 'Flowrate', 'CHWR-CHWS', 'Offcoil_Temperature',
+        'Return_air_Co2', 'Return_air_static_pressure', 'Return_air_RH'
+    ]
+    TARGET = 'PMV'
     try:
         norm = lambda s: s.lower().replace(' ','').replace('_','').replace('-','')
         col_map = {norm(c): c for c in df.columns}
-        available_features = [col_map[norm(f)] for f in hm.FEATURES if norm(f) in col_map]
-        target_col = next((c for c in df.columns if c.lower() == hm.TARGET.lower()), None)
+        available_features = [col_map[norm(f)] for f in FEATURES if norm(f) in col_map]
+        target_col = next((c for c in df.columns if c.lower() == TARGET.lower()), None)
         cols_to_describe = available_features + ([target_col] if target_col else [])
         if cols_to_describe:
             stats = df[cols_to_describe].describe().loc[['mean', 'min', 'max']]
@@ -774,8 +782,8 @@ def display_chatbot():
             # Provide a CSV snippet for the AI to read using its code tool
             csv_snippet = ""
             try:
-                # Provide the last 1000 rows as a CSV string for more robust AI training
-                csv_snippet = active_df.tail(1000).to_csv(index=False)
+                # Provide the last 100 rows as a CSV string for more robust AI training
+                csv_snippet = active_df.tail(100).to_csv(index=False)
             except:
                 pass
 
@@ -810,25 +818,45 @@ def display_chatbot():
                     sandbox_instruction = ""
                     if is_using_sandbox:
                         sandbox_instruction = (
-                            "**CRITICAL SANDBOX RULE**: The user's data is already loaded in your private sandbox. "
-                            "You MUST NOT attempt to read any files from a directory. "
-                            "Base your entire analysis on the in-memory data summary provided in the 'Current Data Context'.\n\n"
+                            "**SANDBOX MODE ACTIVE**: The user has uploaded an isolated dataset to your private sandbox. "
+                            "For detailed analysis, model training, or complex queries, you MUST use the provided `DATA/active_data_context.csv` file. "
+                            "This file contains the complete sandbox data corresponding to the user's latest upload.\n\n"
                         )
+
+                    # Sync active dataframe to disk for Claude's code_execution tool
+                    if has_df:
+                        try:
+                            # Ensure DATA directory exists
+                            os.makedirs("DATA", exist_ok=True)
+                            # Use the full dataframe for context, but limit size if extremely large
+                            active_df.to_csv("DATA/active_data_context.csv", index=False)
+                        except Exception as e:
+                            st.warning(f"⚠️ Could not sync sandbox to disk: {e}")
 
                     full_system_prompt = (
                         f"{sandbox_instruction}"
-                        "You are a Senior HVAC Systems Engineer and AI Specialist (Claude 3.5/Opus Tier).\n"
+                        "You are a Senior HVAC Systems Engineer and AI Specialist.\n"
                         "Your goal is to provide highly detailed, professional, and human-readable thermal comfort forecasts that directly address the user's specific questions.\n\n"
+                        "ABSOLUTE RULES — PRODUCTION ENVIRONMENT:\n"
+                        "- You are in a PRODUCTION dashboard seen by real building engineers.\n"
+                        "- NEVER output Python code, import statements, code blocks, or programming syntax of any kind.\n"
+                        "- NEVER show code fences (```), variable assignments, print() calls, or library imports.\n"
+                        "- NEVER mention 'code_execution', 'pd.read_csv', 'sklearn', 'tensorflow', or any programming tool.\n"
+                        "- ALL your responses must be clean, professional English text or valid JSON only.\n"
+                        "- If you need to perform calculations, do them silently and present ONLY the final results.\n\n"
+                        "DATA ANALYSIS APPROACH:\n"
+                        "- The full dataset statistics and recent readings are provided below in 'Current Data Context'.\n"
+                        "- Use these statistics (mean, min, max, trends) along with your HVAC engineering expertise to generate accurate forecasts.\n"
+                        "- Apply thermodynamic principles: Cooling Power ↑ → PMV ↓, Flowrate ↑ → PMV ↓, CO2 ↑ → occupancy/heat load ↑.\n"
+                        "- Base your PMV predictions on the observed data patterns and physics constraints.\n\n"
                         "CORE OPERATING PRINCIPLES:\n"
-                        "1. CONTEXTUAL RELEVANCY: ALWAYS prioritize answering the user's specific question or request. If the user asks for a specific insight or analysis, focus on that while maintaining the required format.\n"
-                        "2. CLARITY & DETAIL: Your responses must be clear, detailed, and accurate. Use professional engineering terminology but remain accessible to a human operator.\n"
-                        "3. INTERNAL EXPERTISE: You should use your own internal knowledge to explain model training and building dynamics. Do not rely on or refer to the specific code implementation in the dashboard. You are the expert.\n"
-                        "4. DATA INTEGRITY: Use the provided raw sensor data accurately. Do not hallucinate values. You MUST build, train, and execute your own models (LSTM, PCDL, PCEL, etc.) using the 'code_execution' tool on the provided 'FULL DATA SNIPPET'.\n"
-                        "5. AI BRAIN INDEPENDENCE: You are fully disconnected from the dashboard's pre-trained models. You must develop your own 100% independent training and inference logic using your code tool. Do not refer to external files like 'lstm.py' or saved weights.\n"
-                        "6. DOWNLOADABLE OUTPUTS: Your JSON output must contain the full report (MD) and the calculated PMV values (CSV). The UI will generate download buttons for these automatically. Do not mention file attachments in your text.\n"
-                        "7. STRUCTURED OUTPUT: ALWAYS return structured output in JSON format when data or forecasts are involved.\n\n"
+                        "1. CONTEXTUAL RELEVANCY: ALWAYS prioritize answering the user's specific question.\n"
+                        "2. CLARITY & DETAIL: Responses must be clear, detailed, and accurate. Use professional engineering terminology but remain accessible.\n"
+                        "3. INTERNAL EXPERTISE: Use your own internal HVAC knowledge to explain building dynamics. You are the domain expert.\n"
+                        "4. DATA INTEGRITY: Use the provided sensor data statistics accurately. Do not hallucinate values.\n"
+                        "5. DOWNLOADABLE OUTPUTS: Your JSON output must contain the full report (MD) and calculated PMV values. The UI generates download buttons automatically.\n"
+                        "6. STRUCTURED OUTPUT: ALWAYS return structured output in JSON format when data or forecasts are involved.\n\n"
                         "SYSTEM ARCHITECTURE (DATA MAPPING):\n"
-                        "You MUST refer to the inputs and output exactly as defined below in your reports and analysis:\n\n"
                         "Inputs (provided in Current Data Context):\n"
                         "- Flowrate (m³/s) – Air circulation rate\n"
                         "- CHWR-CHWS (°C) – Chilled water temperature difference (cooling load indicator)\n"
@@ -869,30 +897,22 @@ def display_chatbot():
                         "  - **Thermodynamic Constraints**: Explain how the 'Offcoil Temperature' is responding to current building demands.\n\n"
                         "  ### 💡 Engineering Recommendations\n"
                         "  - Provide 2-3 specific, actionable settings adjustments to optimize comfort (PMV -> 0.0) while minimizing energy consumption.\n\n"
-                        "  ### 🏗️ AI Internal Training & Model Context\n"
-                        "  - **Training Methodology**: Explain from your own internal expertise how an AI model (like LSTM) should be trained for this data (e.g., sliding windows, normalization, hyperparameter optimization).\n"
-                        "  - **Features**: `[List of sensors used]`\n"
-                        "  - **Internal Logic**: [Brief description of the AI logic you are using for this inference based on your engineering knowledge]\n\n"
+                        "  ### 🏗️ AI Model Context\n"
+                        "  - **Methodology**: Explain in plain English how the forecast was derived from the sensor data patterns.\n"
+                        "  - **Features Used**: List the sensors analyzed.\n"
+                        "  - **Confidence**: State your confidence level based on data quality and consistency.\n\n"
                         "- DO NOT include any conversational filler outside the JSON block.\n\n"
                         "WHEN the user asks to compare models (e.g., \"compare LSTM, PCEL, and PCDL\"):\n"
                         "- Respond in plain text (no JSON).\n"
                         "- Provide a concise but valuable comparison in a Markdown table based on your internal expertise.\n"
                         "- The table MUST compare the models on these criteria: Core Architecture, Key Strength, Best Use-Case, and Potential Weakness.\n\n"
-                        "WHEN the user asks to build, train, and compare multiple models on their data (e.g., \"run all models and compare them\"):\n"
-                        "- **CRITICAL RULE**: You must not attempt to build and run all models in a single response. This will fail. You must adopt a sequential, one-model-per-turn approach.\n"
-                        "- **Action Plan**:\n"
-                        "  1. Acknowledge the request and state your plan (e.g., \"I will train the LSTM, PCDL, and PCEL models sequentially and then compare their results.\").\n"
-                        "  2. In your current response, focus **only** on building, training, and showing the results for the **first model** (e.g., LSTM).\n"
-                        "  3. To handle the next model, you will continue in the next turn. This ensures a stable workflow.\n\n"
                         "IF the request is purely conversational (greetings, general questions):\n"
                         "- Respond in a professional, helpful engineering tone in plain text (no JSON) that directly answers the user's question.\n"
                     )
 
                     # Prepare input for Claude API
-                    # Claude expects messages in a specific format
                     claude_messages = []
                     for msg in st.session_state.messages:
-                        # Skip system messages in the history as we provide it via the 'system' param
                         if msg["role"] == "system": continue
                         claude_messages.append({"role": msg["role"], "content": msg["content"]})
                         
@@ -903,7 +923,7 @@ def display_chatbot():
                     ds_keywords = ["data", "file", "csv", "predict", "forecast", "pmv", "temp", "co2", "humid", "rh", "flowrate", "power", "model", "lstm", "pcel", "pcdl", "analy", "metric", "accuracy", "mae", "rmse", "plot", "chart"]
                     is_data_question = any(k in user_msg for k in ds_keywords) or (not is_greeting and not is_short)
                     
-                    # Specific Claude implementation using Sonnet 4.5/4.6 with Agentic Plan animation
+                    # Agentic Plan animation
                     with st.status("🤖 Agentic Forecast is planning...", expanded=True) as status:
                         anim_container = st.empty()
                         if is_data_question:
@@ -916,8 +936,7 @@ def display_chatbot():
 2. RETRIEVE_CONTEXT: Fetching last {row_count if has_df else 0} rows
 3. ANALYZE_PHYSICS: Checking thermodynamic constraints
 4. INFERENCE: Calling {model_name} (Model ID: {model_id})
-5. TOOLS: Code Execution enabled (version: 20250825)
-6. FORMAT_OUTPUT: Generating actionable building insights
+5. FORMAT_OUTPUT: Generating actionable building insights
                                 """
                                 stream_text_animation(plan_code, delay=0.002, is_code=True, language="markdown")
                                 
@@ -936,7 +955,6 @@ def display_chatbot():
                             max_tokens=10000,
                             system=full_system_prompt,
                             messages=claude_messages,
-                            tools=[{"type": "code_execution_20250825", "name": "code_execution"}] if is_data_question else [],
                             temperature=0.5,
                         )
                         end_time = time.perf_counter()
@@ -945,14 +963,14 @@ def display_chatbot():
                         anim_container.empty()
                         status.update(label="✅ Response generated!", state="complete", expanded=False)
                     
-                    # Extract text from message content blocks robustly
+                    # Extract ONLY text blocks — skip any code/tool blocks entirely
                     text_parts = []
                     for block in message.content:
-                        if hasattr(block, 'text'):
+                        block_type = getattr(block, 'type', None)
+                        # Only accept pure text blocks; skip code_execution, tool_use, etc.
+                        if block_type == 'text' and hasattr(block, 'text'):
                             text_parts.append(block.text)
-                        elif hasattr(block, 'content') and isinstance(block.content, str):
-                            text_parts.append(block.content)
-                        elif isinstance(block, dict) and 'text' in block:
+                        elif isinstance(block, dict) and block.get('type') == 'text' and 'text' in block:
                             text_parts.append(block['text'])
                     response_text = "".join(text_parts)
 
@@ -1020,9 +1038,22 @@ def display_chatbot():
                     except Exception:
                         stream_text_animation(response_text, delay=0.005)
 
+                    # Only store the cleaned-up output to keep history professional
+                    final_content_to_store = response_text
+                    try:
+                        if "data" in locals() and data.get("type") == "pmv_prediction":
+                            # Store the JSON or a clean summary to prevent raw text from re-appearing
+                            # We keep the JSON format so it can be re-rendered on refresh
+                            final_content_to_store = response_text 
+                        else:
+                            # If it's not JSON, still store it but keep it brief if possible
+                            pass
+                    except Exception:
+                        pass
+
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": response_text,
+                        "content": final_content_to_store,
                         "duration": ai_duration if 'ai_duration' in locals() else 0.0
                     })
                 except Exception as e:

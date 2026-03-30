@@ -6,14 +6,19 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-import hvac_models as hm
+# (hm import removed)
 
-# Use constants from hvac_models for consistency
-FEATURES = hm.FEATURES
-WINDOW = hm.WINDOW
-EPOCHS = hm.EPOCHS
-BATCH_SIZE = hm.BATCH_SIZE
-PATIENCE = hm.PATIENCE
+# ── LOCAL CONFIGURATION (Self-contained) ──────────────────────────
+HVAC_FEATURES = [
+    'Cooling_Power', 'Flowrate', 'CHWR-CHWS', 'Offcoil_Temperature',
+    'Return_air_Co2', 'Return_air_static_pressure', 'Return_air_RH'
+]
+WINDOW      = 12      # 12 steps × 5 min = 1 hour lookback
+EPOCHS      = 100     # max epochs
+BATCH_SIZE  = 16
+PATIENCE    = 15      # early stopping patience
+
+FEATURES = HVAC_FEATURES # Alias for internal code compatibility
 
 def build_lstm_model(input_shape):
     """Standard LSTM with functional API."""

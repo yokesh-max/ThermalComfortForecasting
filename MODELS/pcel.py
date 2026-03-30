@@ -60,14 +60,86 @@ import random
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import pandas as pd
+import tensorflow as tf
+
+# ── LOCAL CONFIGURATION (Self-contained) ──────────────────────────
+HVAC_FEATURES = [
+    'Cooling_Power', 'Flowrate', 'CHWR-CHWS', 'Offcoil_Temperature',
+    'Return_air_Co2', 'Return_air_static_pressure', 'Return_air_RH'
+]
+HVAC_TARGET = 'PMV'
+WINDOW = 12
+
+import tensorflow as tf
 
 # ── Local imports ─────────────────────────────────────────────────────────────
-import Pcdl as pcdl   # shared library: data prep, training, evaluate
-from pcdl_v1 import VARIANT_V1, run_v1
-from pcdl_v2 import VARIANT_V2, run_v2
-from pcdl_v3 import VARIANT_V3, run_v3
-from pcdl_v4 import VARIANT_V4, run_v4
-from pcdl_v5 import VARIANT_V5, run_v5
+from . import Pcdl as pcdl   # shared library: data prep, training, evaluate
+
+# ── VARIANT CONFIGURATIONS (Internalized) ──────────────────────────────────
+VARIANT_V1 = {
+    "name":     "V1_Actuator",
+    "cooling":  0.30,   # λ1 — ACTIVE: strongest weight
+    "offcoil":  0.00,   # λ2 — inactive
+    "humidity": 0.00,   # λ3 — inactive
+    "bounds":   0.10,   # λ4 — ACTIVE: safety constraint
+}
+
+VARIANT_V2 = {
+    "name":     "V2_Environment",
+    "cooling":  0.00,   # λ1 — inactive
+    "offcoil":  0.20,   # λ2 — ACTIVE: supply air temp dominant
+    "humidity": 0.10,   # λ3 — ACTIVE: humidity
+    "bounds":   0.10,   # λ4 — ACTIVE: safety constraint
+}
+
+VARIANT_V3 = {
+    "name":     "V3_Combined",
+    "cooling":  0.15,   # λ1 — ACTIVE
+    "offcoil":  0.10,   # λ2 — ACTIVE
+    "humidity": 0.10,   # λ3 — ACTIVE
+    "bounds":   0.05,   # λ4 — ACTIVE: light safety constraint
+}
+
+VARIANT_V4 = {
+    "name": "V4_Cooling_Offcoil",
+    "cooling":  0.20,   # λ1 — ACTIVE
+    "offcoil":  0.15,   # λ2 — ACTIVE
+    "humidity": 0.00,   # λ3 — inactive
+    "bounds":   0.05,   # λ4 — ACTIVE
+}
+
+VARIANT_V5 = {
+    "name": "V5_Humidity_Balanced",
+    "cooling":  0.10,   # λ1 — moderate
+    "offcoil":  0.10,   # λ2 — moderate
+    "humidity": 0.15,   # λ3 — strongest humidity emphasis
+    "bounds":   0.05,   # λ4 — ACTIVE
+}
+
+VARIANTS = [VARIANT_V1, VARIANT_V2, VARIANT_V3, VARIANT_V4, VARIANT_V5]
+
+def run_variant(variant_config, data=None, train_df=None, test_df=None):
+    """Unified pipeline for a single PCDL variant."""
+    log.info("=== PCDL %s PIPELINE START ===", variant_config["name"])
+    if data is None:
+        data = pcdl.prepare_data(train_df, test_df)
+    
+    model, history = pcdl.train_variant(data, variant_config)
+    metrics = pcdl.evaluate(model, data)
+    
+    feat_sc = data["feat_scaler"]
+    pmv_sc = data["pmv_scaler"]
+    
+    # Save model
+    pcdl.save_model(model, feat_sc, pmv_sc, model_name=variant_config["name"])
+    
+    # Optional forecast
+    forecasts = None
+    if test_df is not None:
+        forecasts = pcdl.rolling_forecast(model, train_df, test_df, feat_sc, pmv_sc)
+        
+    return model, feat_sc, pmv_sc, metrics, forecasts, history
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -326,35 +398,14 @@ def train_pcel(df):
     histories = {}
     variant_metrics = {}
     
-    # V1
-    m1, _, _, met1, _, h1 = run_v1(data=shared_data)
-    variant_models["v1"] = m1
-    histories["v1"] = h1.history if hasattr(h1, 'history') else h1
-    variant_metrics[VARIANT_V1['name']] = met1
-
-    # V2
-    m2, _, _, met2, _, h2 = run_v2(data=shared_data)
-    variant_models["v2"] = m2
-    histories["v2"] = h2.history if hasattr(h2, 'history') else h2
-    variant_metrics[VARIANT_V2['name']] = met2
-
-    # V3
-    m3, _, _, met3, _, h3 = run_v3(data=shared_data)
-    variant_models["v3"] = m3
-    histories["v3"] = h3.history if hasattr(h3, 'history') else h3
-    variant_metrics[VARIANT_V3['name']] = met3
-
-    # V4
-    m4, _, _, met4, _, h4 = run_v4(data=shared_data)
-    variant_models["v4"] = m4
-    histories["v4"] = h4.history if hasattr(h4, 'history') else h4
-    variant_metrics[VARIANT_V4['name']] = met4
-
-    # V5
-    m5, _, _, met5, _, h5 = run_v5(data=shared_data)
-    variant_models["v5"] = m5
-    histories["v5"] = h5.history if hasattr(h5, 'history') else h5
-    variant_metrics[VARIANT_V5['name']] = met5
+    # Train all 5 variants
+    for i, config in enumerate(VARIANTS, 1):
+        v_key = f"v{i}"
+        log.info("Step 2.%d: Training %s...", i, config["name"])
+        m, _, _, met, _, h = run_variant(config, data=shared_data)
+        variant_models[v_key] = m
+        histories[v_key] = h.history if hasattr(h, 'history') else h
+        variant_metrics[config['name']] = met
 
     # 3. Create Wrapper
     pcel_model = PCELWrapper(variant_models)
@@ -529,65 +580,19 @@ if __name__ == "__main__":
         variant_models = {}
 
     # ── V1: Actuator constraint ───────────────────────────────────────────────
-    if RUN_V1:
-        log.info("")
-        log.info("─" * 60)
-        log.info("PCDL V1 — Actuator Constraint")
-        log.info("─" * 60)
+    # ── Variations training loop ──────────────────────────────────────────────
+    for idx, config in enumerate(VARIANTS, 1):
+        flag_key = f"RUN_V{idx}"
+        if globals().get(flag_key, False):
+            log.info("")
+            log.info("─" * 60)
+            log.info("PCDL V%d — %s", idx, config["name"])
+            log.info("─" * 60)
 
-        # Call run_v1 directly with shared data
-        model_v1, _, _, metrics_v1, _, _ = run_v1(data=shared_data)
-        _log_metrics("PCDL_V1", metrics_v1)
-        all_metrics["PCDL_V1"] = metrics_v1
-        variant_models["v1"]   = model_v1
-
-    # ── V2: Environmental constraint ─────────────────────────────────────────
-    if RUN_V2:
-        log.info("")
-        log.info("─" * 60)
-        log.info("PCDL V2 — Environmental Constraint")
-        log.info("─" * 60)
-
-        model_v2, _, _, metrics_v2, _, _ = run_v2(data=shared_data)
-        _log_metrics("PCDL_V2", metrics_v2)
-        all_metrics["PCDL_V2"] = metrics_v2
-        variant_models["v2"]   = model_v2
-
-    # ── V3: All constraints combined ─────────────────────────────────────────
-    if RUN_V3:
-        log.info("")
-        log.info("─" * 60)
-        log.info("PCDL V3 — All Constraints")
-        log.info("─" * 60)
-
-        model_v3, _, _, metrics_v3, _, _ = run_v3(data=shared_data)
-        _log_metrics("PCDL_V3", metrics_v3)
-        all_metrics["PCDL_V3"] = metrics_v3
-        variant_models["v3"]   = model_v3
-
-    # ── V4: Cooling + Offcoil emphasis ──────────────────────────────────────────
-    if RUN_V4:
-        log.info("")
-        log.info("─" * 60)
-        log.info("PCDL V4 — Cooling + Offcoil Constraint")
-        log.info("─" * 60)
-
-        model_v4, _, _, metrics_v4, _, _ = run_v4(data=shared_data)
-        _log_metrics("PCDL_V4", metrics_v4)
-        all_metrics["PCDL_V4"] = metrics_v4
-        variant_models["v4"]   = model_v4
-
-    # ── V5: Humidity-sensitive comfort ──────────────────────────────────────────
-    if RUN_V5:
-        log.info("")
-        log.info("─" * 60)
-        log.info("PCDL V5 — Humidity Balanced Constraint")
-        log.info("─" * 60)
-
-        model_v5, _, _, metrics_v5, _, _ = run_v5(data=shared_data)
-        _log_metrics("PCDL_V5", metrics_v5)
-        all_metrics["PCDL_V5"] = metrics_v5
-        variant_models["v5"]   = model_v5
+            v_model, _, _, v_metrics, _, _ = run_variant(config, data=shared_data)
+            _log_metrics(f"PCDL_V{idx}", v_metrics)
+            all_metrics[f"PCDL_V{idx}"] = v_metrics
+            variant_models[f"v{idx}"]   = v_model
     # ──────────────────────────────────────────────────────────────────────────
     # LEVEL 3 — PCEL Ensemble (requires all three variants trained)
     # ──────────────────────────────────────────────────────────────────────────

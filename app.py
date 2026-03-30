@@ -10,7 +10,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 from dotenv import load_dotenv
 import agentic as ag
-import Pcdl as pc
+from MODELS import Pcdl as pc
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import tensorflow as tf
@@ -18,9 +18,93 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
 
-import hvac_models as hm
-import lstm
-import pcel
+from MODELS import lstm
+from MODELS import pcel
+
+# ── SHARED CONFIGURATION ──────────────────────────────────────────
+HVAC_FEATURES = [
+    'Cooling_Power',              # primary AC control — 75% importance
+    'Flowrate',                   # cold water volume
+    'CHWR-CHWS',                  # cooling effort
+    'Offcoil_Temperature',        # supply air coldness
+    'Return_air_Co2',             # occupancy proxy
+    'Return_air_static_pressure', # airflow state
+    'Return_air_RH',              # room humidity
+]
+HVAC_TARGET   = 'PMV'
+WINDOW        = 12
+TRAIN_RATIO   = 0.7
+EPOCHS        = 100
+BATCH_SIZE    = 16
+PATIENCE      = 15
+
+# ── SHARED PHYSICS & UTILITIES ────────────────────────────────────
+
+def get_comfort_descriptor(pmv):
+    """Map numerical PMV to human-readable comfort status."""
+    if pmv >= 3.0: return "🔥 Very Hot"
+    if pmv >= 1.0: return "☀️ Warm"
+    if pmv > -1.0: return "✅ Comfortable"
+    if pmv > -3.0: return "🥶 Cool"
+    return "🧊 Very Cold"
+
+def make_windows(X, y, win=WINDOW):
+    """Slide a window of `win` rows along the data."""
+    Xw, yw = [], []
+    for i in range(len(X) - win):
+        Xw.append(X[i : i+win])
+        yw.append(y[i + win])
+    return np.array(Xw), np.array(yw)
+
+def prepare_hvac_data(df, train_ratio=TRAIN_RATIO):
+    """Full pipeline: map columns → split → scale → window."""
+    current_cols = df.columns.tolist()
+    mapped_features = []
+    norm = lambda s: s.lower().replace(' ','').replace('_','').replace('-','')
+    for feat in HVAC_FEATURES:
+        if feat in current_cols: mapped_features.append(feat)
+        else:
+            match = next((c for c in current_cols if norm(c) == norm(feat)), None)
+            if match: mapped_features.append(match)
+            else: return None, None, None, None, None, None, None, None, f"Missing: {feat}"
+    
+    target_col = next((c for c in current_cols if c.lower() == HVAC_TARGET.lower()), None)
+    if not target_col: return None, None, None, None, None, None, None, None, f"Missing: {HVAC_TARGET}"
+    
+    data = df[mapped_features + [target_col]].copy()
+    data = data.interpolate(method='linear', limit=6, limit_direction='both').dropna().reset_index(drop=True)
+    X_raw, y_raw = data[mapped_features].values, data[target_col].values
+    split = int(len(X_raw) * train_ratio)
+    X_train_raw, X_test_raw = X_raw[:split], X_raw[split:]
+    y_train_raw, y_test_raw = y_raw[:split], y_raw[split:]
+    
+    feat_scaler, pmv_scaler = MinMaxScaler(), MinMaxScaler()
+    X_train_sc = feat_scaler.fit_transform(X_train_raw)
+    X_test_sc = feat_scaler.transform(X_test_raw) if len(X_test_raw) > 0 else np.empty((0, X_train_raw.shape[1]))
+    y_train_sc = pmv_scaler.fit_transform(y_train_raw.reshape(-1,1)).ravel()
+    y_test_sc = pmv_scaler.transform(y_test_raw.reshape(-1,1).astype('float32')).ravel() if len(y_test_raw) > 0 else np.array([])
+    
+    X_train_w, y_train_w = make_windows(X_train_sc, y_train_sc)
+    X_test_w, y_test_w = make_windows(X_test_sc, y_test_sc)
+    _, y_train_raw_w = make_windows(X_train_raw, y_train_raw)
+    _, y_test_raw_w = make_windows(X_test_raw, y_test_raw)
+    
+    return X_train_w, y_train_w, X_test_w, y_test_w, y_train_raw_w, y_test_raw_w, feat_scaler, pmv_scaler, None
+
+def evaluate_model(y_true_raw, preds_scaled, pmv_scaler):
+    """Compute performance metrics."""
+    if len(y_true_raw) == 0: return np.array([]), 0.0, 0.0, 0.0, 0.0, 0.0
+    preds_raw = pmv_scaler.inverse_transform(preds_scaled.reshape(-1,1)).ravel()
+    mae = mean_absolute_error(y_true_raw, preds_raw)
+    rmse = np.sqrt(mean_squared_error(y_true_raw, preds_raw))
+    r2 = r2_score(y_true_raw, preds_raw)
+    bias = np.sum(y_true_raw - preds_raw)
+    mape = np.mean(np.abs((y_true_raw - preds_raw) / (np.abs(y_true_raw) + 1e-10))) * 100
+    return preds_raw, mae, rmse, r2, bias, mape
+
+def estimate_pmv_from_sensors(row_dict):
+    """Placeholder estimator — Fanger formula is not used."""
+    return 0.0
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────
 st.set_page_config(
@@ -30,11 +114,12 @@ st.set_page_config(
 )
 
 # ── CUSTOM CSS ────────────────────────────────────────────────────
-if os.path.exists("style.css"):
-    with open("style.css") as f:
+style_path = os.path.join("STYLE", "style.css")
+if os.path.exists(style_path):
+    with open(style_path) as f:
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 else:
-    st.warning("⚠️ style.css not found.")
+    st.warning(f"⚠️ {style_path} not found.")
 
 # ── SESSION STATE INIT ────────────────────────────────────────────
 if "reset_counter" not in st.session_state:
@@ -99,13 +184,7 @@ def clear_model_results():
     st.session_state.model_r2 = 0.0
     st.session_state.pcel_variant_metrics = None
 
-# ── CONFIG FROM hvac_models ───────────────────────────────────────
-HVAC_FEATURES = hm.FEATURES    # single source of truth — never redefine
-HVAC_TARGET   = hm.TARGET
-WINDOW        = hm.WINDOW
-TRAIN_RATIO   = hm.TRAIN_RATIO
-
-# Correct slider ranges from actual building data
+# ── SLIDER CONFIGURATION ──────────────────────────────────────────
 SLIDER_CONFIG = {
     'Cooling_Power':              (0.0,   75000.0, 35000.0, "Cooling Power (W)"),
     'Flowrate':                   (0.0,   2.5,     0.9,     "Flowrate (L/s)"),
@@ -128,19 +207,6 @@ def get_image_as_base64(file_path):
     except Exception:
         return ""
 
-# FIX 9 — cache data loading so sliders don't retrigger file read
-# load_dataframe moved to agentic.py
-
-
-# stream_text_animation moved to agentic.py
-
-
-# get_ai_insights moved to agentic.py
-
-
-
-
-
 def perform_hvac_eda(df):
     """Generate visualisations for Exploratory Data Analysis with educational explanations."""
     import seaborn as sns
@@ -148,7 +214,6 @@ def perform_hvac_eda(df):
     st.markdown("#### 📈 Exploratory Data Analysis Results")
     st.info("EDA helps us understand the relationships, trends, and quality of our sensor data before training models.")
     
-    # 1. Correlation Heatmap
     st.write("**1. Feature Correlation Heatmap**")
     st.caption("How do different sensors relate to each other and PMV? Values close to 1 or -1 indicate strong relationships.")
     numeric_df = df[HVAC_FEATURES + [HVAC_TARGET]].select_dtypes(include=[np.number])
@@ -203,8 +268,6 @@ def perform_hvac_eda(df):
         plt.tight_layout()
         st.pyplot(fig_box)
 
-
-
 def train_selected_model(df, model_type="LSTM"):
     """
     Train the selected model (LSTM or PCDL) on uploaded data.
@@ -214,7 +277,7 @@ def train_selected_model(df, model_type="LSTM"):
     # Prepare data
     X_train_w, y_train_w, X_test_w, y_test_w, \
     y_train_raw_w, y_test_raw_w, \
-    feat_scaler, pmv_scaler, error_msg = hm.prepare_hvac_data(df)
+    feat_scaler, pmv_scaler, error_msg = prepare_hvac_data(df)
     
     if error_msg:
         return {'error': error_msg}
@@ -232,13 +295,13 @@ def train_selected_model(df, model_type="LSTM"):
             )
             preds_raw = pcel_metrics['preds_real']
         else:
-            model, history = hm.train_lstm(X_train_w, y_train_w, X_test_w, y_test_w)
+            model, history = lstm.train_lstm(X_train_w, y_train_w, X_test_w, y_test_w)
         
         # Guard: Only predict if we have test data in this file (Skip for PCEL as it already evaluated)
         if model_type != "PCEL":
             if X_test_w is not None and getattr(X_test_w, "size", 0) > 0:
                 preds_sc = model.predict(X_test_w, verbose=0)
-                preds_raw, mae, rmse, r2, bias, mape = hm.evaluate_model(y_test_raw_w, preds_sc, pmv_scaler)
+                preds_raw, mae, rmse, r2, bias, mape = evaluate_model(y_test_raw_w, preds_sc, pmv_scaler)
                 
                 # Confidence Interval via MC Dropout
                 try:
@@ -278,12 +341,6 @@ def train_selected_model(df, model_type="LSTM"):
     
     except Exception as e:
         return {'error': f'Training error: {str(e)}'}
-
-
-# Prophet removed from supported models per user request.
-
-# display_chatbot moved to agentic.py
-
 
 # ── SIDEBAR ───────────────────────────────────────────────────────
 with st.sidebar:
@@ -344,9 +401,7 @@ with st.sidebar:
         </div>
     """, unsafe_allow_html=True)
 
-
 # ── MAIN DATA CONTEXT (Global) ────────────────────────────────────
-# This ensures that selections made in the Dashboard persist across all tabs
 if "last_main_func" not in st.session_state:
     st.session_state.last_main_func = "Select"
 
@@ -368,14 +423,10 @@ with col_l2:
         <div class="header-spacer"></div>
     """, unsafe_allow_html=True)
 
-# Chatbot moved inside Dashboard -> Model Selection -> Agentic Forecast
 if nav_choice == "Reports":
     st.markdown("<h2 style='text-align:center;'>📈 Model Performance Reports</h2>", unsafe_allow_html=True)
     if st.session_state.get("model_trained", False):
-        # Prefer test metrics if available, otherwise show training metrics
         tm = st.session_state.get("test_metrics", {})
-        
-        # Consistent data mapping
         mae  = tm.get('mae', st.session_state.get('model_mae', 0.0))
         rmse = tm.get('rmse', st.session_state.get('model_rmse', 0.0))
         r2   = tm.get('r2', st.session_state.get('model_r2', 0.0))
@@ -408,11 +459,8 @@ if nav_choice == "Reports":
         st.warning("⚠️ No model has been trained yet. Please go to the **Home**, upload data, and train the LSTM model to generate a report.")
 
 else: # nav_choice == "Home"
-    # ── SELECT FUNCTION AREA ──────────────────────────────────────────
-    # main_func is already initialized globally at the top
     uploaded_file = None
     if func_choice == "Forecasting":
-        # User style layout: Text on left, selectbox on right
         sf_col1, sf_col2 = st.columns([1, 2])
         with sf_col1:
             st.markdown(
@@ -421,7 +469,6 @@ else: # nav_choice == "Home"
                 unsafe_allow_html=True
             )
         with sf_col2:
-            # Get the index based on persisted state
             options = ["Select", "Thermal Comfort Forecasting"]
             default_index = options.index(st.session_state.last_main_func) if st.session_state.last_main_func in options else 0
             
@@ -432,14 +479,11 @@ else: # nav_choice == "Home"
                 label_visibility = "collapsed",
                 key = f"main_func_select_{st.session_state.reset_counter}"
             )
-            # Persist main_func in session state manually to survive tab switching
             st.session_state.last_main_func = main_func
 
         if main_func == "Thermal Comfort Forecasting":
-            # ── FILE UPLOADER ─────────────────────────────────────────────────
             st.markdown('<div class="dashboard-spacer"></div>', unsafe_allow_html=True)
             uploaded_file = None
-            # Refactored to horizontal layout
             up_col1, up_col2 = st.columns([1, 2])
             with up_col1:
                 st.markdown(
@@ -474,10 +518,7 @@ else: # nav_choice == "Home"
     elif main_func == "Select":
         st.info("⬆️ **Please select 'Thermal Comfort Forecasting' to upload your data.**")
 
-
-    # ── MAIN DATA & MODELLING AREA ────────────────────────────────────
     if uploaded_file is not None:
-        # Reset progressive flow if file changes
         file_key = f"file_{uploaded_file.name}_{uploaded_file.size}"
         if st.session_state.get("last_file_key") != file_key:
             st.session_state.last_file_key = file_key
@@ -490,9 +531,7 @@ else: # nav_choice == "Home"
 
         if st.session_state.main_df is None:
             file_ext   = os.path.splitext(uploaded_file.name)[1].lower()
-            file_bytes = uploaded_file.read()   # read once, cache handles reuse
-
-            # FIX 9 — cached data loading
+            file_bytes = uploaded_file.read()
             try:
                 df = ag.load_dataframe(file_bytes, file_ext)
                 if df is not None:
@@ -504,19 +543,16 @@ else: # nav_choice == "Home"
                 st.error(f"Error reading file: {e}")
                 st.session_state.main_df = None
 
-    # Use persisted df if available
     df = st.session_state.get("main_df")
     if df is not None:
         st.success(f"**✅ Active Dataset**: {st.session_state.main_df_name}  "
                     f"({df.shape[0]} rows × {df.shape[1]} columns)")
 
-        # ── DATA PREVIEW ─────────────────────────────────────────
         with st.expander("📄 **Detailed Data Preview**", expanded=False):
             st.dataframe(df, use_container_width=True)
             st.caption(f"**Dimensions**: {df.shape[0]} rows × "
                         f"{df.shape[1]} columns")
 
-        # ── DATA EDA ──────────────────────────────────────────────
         st.markdown("<div style='margin-bottom:30px;'></div>", unsafe_allow_html=True)
         eda_col1, eda_col2 = st.columns([2, 1])
         with eda_col1:
@@ -540,7 +576,6 @@ else: # nav_choice == "Home"
             with st.expander("📊 Exploratory Data Analysis", expanded=True):
                 perform_hvac_eda(df)
 
-            # ── PREPROCESSING ─────────────────────────────────────────
             st.markdown("<div style='margin-bottom:30px;'></div>", unsafe_allow_html=True)
             pp_col1, pp_col2 = st.columns([2, 1])
             with pp_col1:
@@ -556,14 +591,9 @@ else: # nav_choice == "Home"
             if start_pp:
                 with st.status("Running Preprocessing...", expanded=True) as status:
                     st.write("Validating data structure...")
-                    
-                    # Flexible matching logic
                     norm = lambda s: s.lower().replace(' ','').replace('_','').replace('-','')
                     col_map = {norm(c): c for c in df.columns}
-                    
-                    # Check features
                     missing_features = [f for f in HVAC_FEATURES if norm(f) not in col_map]
-                    # Check target
                     target_found = norm(HVAC_TARGET) in col_map
                     
                     if missing_features or not target_found:
@@ -575,10 +605,8 @@ else: # nav_choice == "Home"
                                       state="error", expanded=False)
                     else:
                         st.write("Cleaning records...")
-                        # Map to actual column names in the df
                         actual_features = [col_map[norm(f)] for f in HVAC_FEATURES]
                         actual_target = col_map[norm(HVAC_TARGET)]
-                        
                         initial_len = len(df)
                         df = df.dropna(subset=actual_features + [actual_target])
                         dropped = initial_len - len(df)
@@ -590,7 +618,6 @@ else: # nav_choice == "Home"
                         st.session_state.data_preprocessed = True
                         st.success("**✅ Dataset validated. Ready for modelling.**")
                 
-            # ── AI INSIGHTS ───────────────────────────────────────────
             st.markdown("<div style='margin-bottom:30px;'></div>", unsafe_allow_html=True)
             if st.session_state.data_preprocessed:
                 ai_col1, ai_col2 = st.columns([2, 1])
@@ -614,7 +641,6 @@ else: # nav_choice == "Home"
                     with st.status(f" Claude ({model_choice}) is planning your analysis...", expanded=True) as status:
                         st.markdown('<div class="thinking-status">📑 Drafting analysis protocol... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
                         ag.stream_text_animation("", delay=0.01)
-                        
                         plan_code = f"""
 **📋 ANALYSIS EXECUTION PLAN**
 1. SCAN_HISTORY: Reading latest {len(df)} data points
@@ -625,24 +651,16 @@ else: # nav_choice == "Home"
 6. OPTIMIZE_VALUES: Determining PMV=0 settings
                         """
                         ag.stream_text_animation(plan_code, delay=0.005, is_code=True, language="markdown")
-                        
                         st.markdown('<div class="thinking-status">📊 Calculating thermodynamic correlations... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
                         ag.stream_text_animation("", delay=0.01)
-                        
                         st.markdown('<div class="thinking-status">🧠 Finalizing actionable insights... <div class="dot-flashing"></div></div>', unsafe_allow_html=True)
                         ag.stream_text_animation("", delay=0.01)
-                        
-                        # Pass the latest reading too
                         latest_reading = df.sort_values('DateTime')[HVAC_FEATURES].iloc[-1]
                         insights, opt_values = ag.get_ai_insights(df, latest_reading, model_id=model_id)
                         status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
-                    
-                    # Store results in session state
                     st.session_state.insights_generated = True
                     st.session_state.ai_insights_text = insights
                     st.session_state.ai_recommendations = opt_values
-                    
-                    # Word-by-word streaming for the initial display
                     with st.expander("🔍 **Detailed AI Analysis**", expanded=True):
                         ag.stream_text_animation(insights.split('OPTIMAL_VALUES:')[0], delay=0.005)
 
@@ -650,13 +668,10 @@ else: # nav_choice == "Home"
                     with st.expander("🔍 **Detailed AI Analysis**", expanded=True):
                         st.markdown(st.session_state.ai_insights_text.split('OPTIMAL_VALUES:')[0])
 
-            # ── HVAC MODELLING AREA ───────────────────────────────────
             if st.session_state.get("insights_generated"):
                 st.markdown("---")
                 st.markdown('<div class="dashboard-spacer"></div>', unsafe_allow_html=True)
                 st.markdown("<h4>🔬 HVAC Thermal Comfort Modelling</h4>", unsafe_allow_html=True)
-
-                # Model Selection - Two-column layout: Label on left, Box on right
                 ms_col1, ms_col2 = st.columns([1, 2])
                 with ms_col1:
                     st.markdown(
@@ -669,7 +684,6 @@ else: # nav_choice == "Home"
                         st.session_state.last_hvac_model_choice = "Select Model"
                     model_options = ["Select Model", "LSTM", "PCEL", "PCDL", "Agentic Forecast"]
                     default_mod_idx = model_options.index(st.session_state.last_hvac_model_choice) if st.session_state.last_hvac_model_choice in model_options else 0
-                    
                     hvac_model_choice = st.selectbox(
                         label = "Select Model",
                         options = model_options,
@@ -703,14 +717,11 @@ else: # nav_choice == "Home"
                         st.markdown('</div>', unsafe_allow_html=True)
 
                     if train_clicked:
-                        # Ensure DateTime column is sorted
                         if 'DateTime' in df.columns:
                             df['DateTime'] = pd.to_datetime(df['DateTime'])
                             df = df.sort_values('DateTime').reset_index(drop=True)
-
                         with st.spinner(f"⏳ Training {hvac_model_choice} model..."):
                             result = train_selected_model(df, hvac_model_choice)
-                            
                             if 'error' in result and result['error']:
                                 st.error(f"❌ {result['error']}")
                             else:
@@ -726,21 +737,16 @@ else: # nav_choice == "Home"
                                 st.session_state.model_mape       = result['mape_test']
                                 st.session_state.model_ci_width   = result['ci_width_test']
                                 st.session_state.pcel_variant_metrics = result.get('variant_metrics')
-                                
-                                # Store real last 12 readings
                                 X_raw = df[HVAC_FEATURES].values
                                 st.session_state.last_12_raw = X_raw[-WINDOW:] if len(X_raw) >= WINDOW else X_raw
-                                
                                 if result.get('has_test_results'):
                                     st.success(f"✅ {st.session_state.hvac_type} model trained successfully!")
                                 else:
                                     st.success(f"✅ {st.session_state.hvac_type} model trained successfully! (Evaluation held for Test Section)")
 
-            # ── TEST DATA EVALUATION ─────────────────────────────────────
             if st.session_state.get("model_trained", False) and hvac_model_choice != "Agentic Forecast":
                 st.markdown("---")
                 st.markdown("<h4>📉 Verify Model with Test Data</h4>", unsafe_allow_html=True)
-                
                 td_col1, td_col2 = st.columns([1, 2])
                 with td_col1:
                     st.markdown(
@@ -764,24 +770,19 @@ else: # nav_choice == "Home"
                             key   = f"test_file_{st.session_state.reset_counter}",
                             label_visibility = "collapsed",
                         )
-                    
                     test_df = None
                     if test_file is not None:
                         test_ext = os.path.splitext(test_file.name)[1].lower()
                         test_bytes = test_file.read()
                         test_df = ag.load_dataframe(test_bytes, test_ext)
-
                     if test_df is not None:
                         st.session_state.test_data_loaded = True
-                        # ... mapping and cleaning ...
                         norm = lambda s: s.lower().replace(' ','').replace('_','').replace('-','')
                         col_map = {norm(c): c for c in test_df.columns if norm(c)}
                         actual_features = [col_map[norm(f)] for f in HVAC_FEATURES if norm(f) in col_map]
                         test_clean = test_df.dropna(subset=actual_features).copy()
-                        
                         if not test_clean.empty:
                             with st.spinner("Calculating PMV predictions..."):
-                                # ... (existing calculation logic) ...
                                 actual_pmv_list = []
                                 forecast_pmv_list = []
                                 current_history = st.session_state.last_12_raw.copy()
@@ -789,39 +790,29 @@ else: # nav_choice == "Home"
                                 feat_scaler = st.session_state.hvac_feat_scaler
                                 pmv_scaler = st.session_state.hvac_pmv_scaler
                                 target_col_test = next((c for c in test_df.columns if c.lower() == HVAC_TARGET.lower()), None)
-
                                 for idx, row in test_clean.iterrows():
                                     row_dict = {f: row[col_map[norm(f)]] for f in HVAC_FEATURES}
-                                    actual_val = float(row[target_col_test]) if target_col_test else hm.estimate_pmv_from_sensors(row_dict)
+                                    actual_val = float(row[target_col_test]) if target_col_test else estimate_pmv_from_sensors(row_dict)
                                     actual_pmv_list.append(actual_val)
-
                                     X_history_scaled = feat_scaler.transform(current_history).reshape(1, WINDOW, len(HVAC_FEATURES)).astype('float32')
                                     pred_scaled = model(X_history_scaled, training=False).numpy()[0][0] if hasattr(model, '__call__') else model.predict(X_history_scaled, verbose=0)[0][0]
                                     forecast_pmv = float(pmv_scaler.inverse_transform([[pred_scaled]])[0][0])
                                     forecast_pmv_list.append(forecast_pmv)
-                                    
                                     new_input = np.array([row_dict[f] for f in HVAC_FEATURES], dtype='float32')
                                     current_history = np.vstack([current_history[1:], new_input])
-
                                 test_clean['Actual PMV (Data)'] = actual_pmv_list
                                 test_clean['AI Forecast PMV'] = forecast_pmv_list
                                 test_clean['Residual (Difference)'] = test_clean['Actual PMV (Data)'] - test_clean['AI Forecast PMV']
-                                test_clean['Comfort Status (Data)'] = test_clean['Actual PMV (Data)'].apply(hm.get_comfort_descriptor)
-                                test_clean['Comfort Status (AI)'] = test_clean['AI Forecast PMV'].apply(hm.get_comfort_descriptor)
-                                
+                                test_clean['Comfort Status (Data)'] = test_clean['Actual PMV (Data)'].apply(get_comfort_descriptor)
+                                test_clean['Comfort Status (AI)'] = test_clean['AI Forecast PMV'].apply(get_comfort_descriptor)
                                 st.session_state.test_df_results = test_clean
-                                
-                                # Metrics calculation
                                 actuals = np.array(actual_pmv_list)
                                 forecasts = np.array(forecast_pmv_list)
-                                
-                                # Designate hvac_models as the single source of truth for metrics
-                                _, mae, rmse, r2, bias, mape = hm.evaluate_model(
+                                _, mae, rmse, r2, bias, mape = evaluate_model(
                                     actuals, 
                                     pmv_scaler.transform(forecasts.reshape(-1,1)).ravel(), 
                                     pmv_scaler
                                 )
-                                
                                 # Confidence Interval via MC Dropout for test data
                                 try:
                                     X_test_all = []
